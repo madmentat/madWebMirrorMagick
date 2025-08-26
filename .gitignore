@@ -1,0 +1,32 @@
+# компиляторные мусорные файлы
+*.o
+*.obj
+*.exe
+*.out
+*.a
+*.so
+*.dll
+*.lib
+*.pdb
+
+# бинарь проекта
+madbackuper
+
+# временные и бэкап файлы
+*.swp
+*.swo
+*~
+*.bak.*
+*.save
+*.tmp
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# артефакты сборки
+build/
+dist/
