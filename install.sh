@@ -25,16 +25,16 @@ have_libssh_headers() {
 }
 
 install_deps_debian() {
-  echo "📦 Устанавливаю зависимости сборки…"
+  echo "📦 Устанавливаю зависимости сборки и SSH transport…"
   $SUDO apt-get update
-  $SUDO apt-get install -y build-essential libssh-dev sudo
+  $SUDO apt-get install -y build-essential libssh-dev openssh-client sudo
 }
 
-if ! need_cmd g++ || ! need_cmd make || ! have_libssh_headers; then
+if ! need_cmd g++ || ! need_cmd make || ! need_cmd ssh || ! have_libssh_headers; then
   if need_cmd apt-get; then
     install_deps_debian
   else
-    echo "❌ Нужны g++, make, sudo и libssh development headers. Автоустановка пока реализована для apt-based систем." >&2
+    echo "❌ Нужны g++, make, ssh (OpenSSH client), sudo и libssh development headers. Автоустановка пока реализована для apt-based систем." >&2
     exit 1
   fi
 fi
@@ -83,7 +83,8 @@ echo "✅ Runtime privilege model установлен:"
 echo "   • $SERVICE_USER не имеет shell-login;"
 echo "   • sudo/root пароль программе не нужен;"
 echo "   • privileged операции доступны только через $HELPER_DST;"
-echo "   • web-копии создаются под /srv/madwebmirror/sites/<site-id>."
+echo "   • web-копии создаются под /srv/madwebmirror/sites/<site-id>;"
+echo "   • OpenSSH client доступен для jump/bastion transport через Proxy A/Proxy B."
 echo
 echo "✨ Сейчас будет запущен madUI."
 echo "   Откройте напечатанный ниже адрес в браузере."
