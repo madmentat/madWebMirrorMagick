@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cctype>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <iomanip>
@@ -31,6 +32,7 @@
 #include <vector>
 
 #include "mad/enroll.hpp"
+#include "mad/transport.hpp"
 #include "mad/tunnels.hpp"
 
 namespace mad {
@@ -39,6 +41,7 @@ namespace {
 constexpr std::size_t MAX_HEADER = 64 * 1024;
 constexpr std::size_t MAX_BODY = 256 * 1024;
 constexpr auto REQUEST_TTL = std::chrono::minutes(5);
+constexpr const char* HELPER_PATH = "/usr/local/libexec/madweb-helper";
 
 struct HttpRequest {
     std::string method;
@@ -109,9 +112,7 @@ std::string random_string(std::size_t n, const char* alphabet) {
     return out;
 }
 
-std::string random_hex(std::size_t n) {
-    return random_string(n, "0123456789abcdef");
-}
+std::string random_hex(std::size_t n) { return random_string(n, "0123456789abcdef"); }
 
 std::string verification_code() {
     const std::string raw = random_string(8, "ABCDEFGHJKLMNPQRSTUVWXYZ23456789");
@@ -204,7 +205,6 @@ bool read_request(int fd, const std::string& remote_ip, HttpRequest& req) {
     data.reserve(4096);
     char buf[4096];
     std::size_t header_end = std::string::npos;
-
     while ((header_end = data.find("\r\n\r\n")) == std::string::npos) {
         const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) return false;
@@ -385,78 +385,90 @@ std::string tunnels_json(const std::vector<ManagedTunnel>& tunnels) {
     return out.str();
 }
 
+int helper_verb(const char* verb) {
+    const std::string cmd = std::string(HELPER_PATH) + " " + verb + " >/dev/null 2>&1";
+    return std::system(cmd.c_str());
+}
+
+bool tunnel_service_active() { return helper_verb("tunnels-status") == 0; }
+
+bool has_enabled_tunnel(const std::vector<ManagedTunnel>& tunnels) {
+    return std::any_of(tunnels.begin(), tunnels.end(), [](const ManagedTunnel& t) { return t.spec.enabled; });
+}
+
+bool validate_ui_config(const Config& cfg, std::string& err) {
+    if (cfg.target_server != "nginx" && cfg.target_server != "apache2") {
+        err = "target_server должен быть nginx или apache2";
+        return false;
+    }
+    if (cfg.ssh_port <= 0 || cfg.ssh_port > 65535) {
+        err = "ssh_port должен быть 1..65535";
+        return false;
+    }
+    try {
+        const auto profile = transport_profile_from_config(cfg);
+        if (!validate_transport_profile(profile, err)) return false;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    if (cfg.health_interval_sec < 5) {
+        err = "health_interval_sec должен быть >= 5";
+        return false;
+    }
+    return true;
+}
+
 std::string ui_html() {
     return R"MADUI(<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>madUI · madWebMirrorMagick</title>
 <style>
 :root{--bg:#07101c;--panel:rgba(14,27,45,.76);--line:rgba(146,199,255,.16);--text:#edf7ff;--muted:#8ea7bb;--a:#75f2d0;--b:#7f9cff;--c:#ff85c8;--ok:#71f6b5;--warn:#ffd36d;--danger:#ff718f;--shadow:0 30px 90px rgba(0,0,0,.42)}
-*{box-sizing:border-box}html,body{margin:0;min-height:100%;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
-body{overflow-x:hidden;background:radial-gradient(900px 600px at 12% -5%,rgba(78,112,255,.24),transparent 65%),radial-gradient(800px 620px at 95% 8%,rgba(255,77,174,.16),transparent 62%),radial-gradient(900px 700px at 55% 105%,rgba(54,229,194,.12),transparent 65%),#07101c}
-body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.28;background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);background-size:36px 36px;mask-image:linear-gradient(to bottom,black,transparent 92%)}
-.shell{display:grid;grid-template-columns:245px minmax(0,1fr);min-height:100vh}.side{position:sticky;top:0;height:100vh;padding:26px 18px;border-right:1px solid var(--line);background:rgba(5,12,22,.6);backdrop-filter:blur(24px)}
-.brand{display:flex;align-items:center;gap:12px;padding:3px 8px 28px}.orb{width:38px;height:38px;border-radius:14px;background:conic-gradient(from 215deg,var(--a),var(--b),var(--c),var(--a));box-shadow:0 0 42px rgba(117,242,208,.22);position:relative}.orb:after{content:"m";position:absolute;inset:3px;display:grid;place-items:center;border-radius:11px;background:#08111e;font-weight:900;font-size:22px}.brand b{font-size:20px;letter-spacing:-.04em}.brand span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.16em;margin-top:2px}
-.nav{display:grid;gap:7px}.nav button{all:unset;display:flex;align-items:center;gap:11px;padding:11px 12px;border-radius:12px;color:#91a9bb;cursor:pointer;font-size:13px}.nav button:hover,.nav button.active{color:#f4fbff;background:linear-gradient(90deg,rgba(117,242,208,.12),rgba(127,156,255,.08));box-shadow:inset 0 0 0 1px rgba(137,210,255,.09)}.doticon{width:8px;height:8px;border-radius:50%;border:1px solid currentColor}.nav button.active .doticon{background:var(--a);border-color:var(--a);box-shadow:0 0 18px var(--a)}
-.sidefoot{position:absolute;bottom:24px;left:18px;right:18px;padding:14px;border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.025)}.sidefoot small,.muted{color:var(--muted)}.secure{margin-top:7px;color:var(--ok);font-size:12px}
-.main{padding:34px clamp(24px,4vw,58px) 70px;max-width:1600px;width:100%}.top{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:28px}.eyebrow{font-size:11px;letter-spacing:.18em;color:var(--a);text-transform:uppercase;font-weight:800}.top h1{font-size:clamp(34px,4.2vw,62px);letter-spacing:-.055em;line-height:.96;margin:8px 0 10px;background:linear-gradient(110deg,#fff 10%,#c9e2ff 52%,#9ff2dc);-webkit-background-clip:text;color:transparent}.sub{color:var(--muted);max-width:720px;line-height:1.6;font-size:14px}.pill{padding:9px 13px;border:1px solid rgba(113,246,181,.22);background:rgba(113,246,181,.07);border-radius:999px;color:var(--ok);font-size:12px;white-space:nowrap}.pill:before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--ok);margin-right:8px;box-shadow:0 0 14px var(--ok)}
-.grid{display:grid;grid-template-columns:1.35fr .85fr;gap:18px}.card{border:1px solid var(--line);background:linear-gradient(145deg,rgba(20,37,60,.77),rgba(8,18,31,.74));box-shadow:var(--shadow);border-radius:22px;backdrop-filter:blur(20px);overflow:hidden}.cardhead{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:19px 21px;border-bottom:1px solid rgba(255,255,255,.055)}.cardhead b{font-size:13px}.muted{font-size:12px}
-.arch{padding:24px;display:grid;grid-template-columns:1fr 90px 1fr;align-items:center;gap:14px;min-height:250px}.proxy{padding:18px;border:1px solid rgba(255,255,255,.1);border-radius:18px;background:rgba(5,15,27,.72);position:relative;overflow:hidden}.proxy:before{content:"";position:absolute;inset:-60% auto auto -20%;width:170px;height:170px;background:radial-gradient(circle,rgba(117,242,208,.15),transparent 68%)}.proxy.b:before{left:auto;right:-20%;background:radial-gradient(circle,rgba(255,133,200,.13),transparent 68%)}.proxy .role{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}.proxy h3{margin:8px 0 5px;font-size:19px}.mono{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#acd0e6;overflow-wrap:anywhere}.status{display:flex;align-items:center;gap:7px;margin-top:14px;color:var(--ok);font-size:11px}.status i{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 13px var(--ok)}.cross{position:relative;height:70px}.cross:before,.cross:after{content:"";position:absolute;left:0;right:0;top:34px;height:1px;background:linear-gradient(90deg,var(--a),var(--b),var(--c));box-shadow:0 0 16px rgba(127,156,255,.45)}.cross:after{transform:rotate(18deg)}.cross span{position:absolute;inset:0;display:grid;place-items:center;font-size:10px;color:#bdd4e4;z-index:1;text-shadow:0 2px 8px #07101c;background:radial-gradient(circle at center,#0b1727 0 19px,transparent 20px)}
-.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:0 21px 21px}.metric{padding:15px;border:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.025);border-radius:15px}.metric small{color:var(--muted);display:block;font-size:10px;text-transform:uppercase;letter-spacing:.1em}.metric b{display:block;margin-top:7px;font-size:16px;overflow-wrap:anywhere}
-.modules{padding:13px 18px 19px}.module{display:flex;align-items:center;justify-content:space-between;padding:12px 2px;border-bottom:1px solid rgba(255,255,255,.05)}.module:last-child{border:0}.module strong{font-size:12px}.module span{font-size:11px;color:var(--muted)}.switch{width:34px;height:19px;border-radius:20px;background:rgba(117,242,208,.18);border:1px solid rgba(117,242,208,.25);position:relative}.switch:after{content:"";position:absolute;right:3px;top:3px;width:11px;height:11px;border-radius:50%;background:var(--a);box-shadow:0 0 12px var(--a)}
-.setup,.sshcard,.tunnelcard{grid-column:1/-1}.form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px;padding:21px}.field{display:grid;gap:7px}.field.span2{grid-column:span 2}.field.span4{grid-column:span 4}.field label{font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:#829bb0}.field input,.field select{width:100%;border:1px solid rgba(147,199,255,.13);border-radius:12px;padding:11px 12px;background:rgba(2,9,17,.58);color:#eaf7ff;outline:none}.field input:focus,.field select:focus{border-color:rgba(117,242,208,.55);box-shadow:0 0 0 3px rgba(117,242,208,.07)}.actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:10px;padding:0 21px 21px}.btn{border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:11px 16px;background:rgba(255,255,255,.04);color:#c8dbe9;cursor:pointer;font-weight:700}.btn.primary{border:0;color:#06111b;background:linear-gradient(120deg,var(--a),#9cc7ff);box-shadow:0 10px 30px rgba(117,242,208,.16)}.btn.pink{border:0;color:#140914;background:linear-gradient(120deg,#ff9bd1,#b2a7ff)}.btn:disabled{opacity:.5;cursor:not-allowed}
-.sshgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:21px}.sshnode{padding:17px;border-radius:17px;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.025)}.sshnode h3{font-size:13px;margin:0 0 13px}.sshnode .fields{display:grid;gap:10px}.hint{font-size:11px;line-height:1.55;color:var(--muted);padding:0 21px 18px}.hint code{color:#bcebdc}.tunnels{padding:16px 21px 8px}.trow{display:grid;grid-template-columns:1.1fr .85fr .8fr 1.15fr .65fr 1.15fr .65fr auto;gap:8px;align-items:center;margin-bottom:8px}.trow input,.trow select{min-width:0;width:100%;border:1px solid rgba(147,199,255,.12);border-radius:10px;padding:9px;background:rgba(2,9,17,.58);color:#eaf7ff}.trow button{border:1px solid rgba(255,113,143,.22);background:rgba(255,113,143,.07);color:#ff9bb0;border-radius:10px;padding:9px 11px;cursor:pointer}.thead{font-size:9px;color:#7690a5;text-transform:uppercase;letter-spacing:.08em}.check{display:flex;justify-content:center}.check input{width:16px;height:16px}
-.toast{position:fixed;right:25px;bottom:25px;padding:13px 16px;border-radius:13px;background:#102338;border:1px solid var(--line);box-shadow:var(--shadow);opacity:0;transform:translateY(12px);pointer-events:none;transition:.25s;max-width:min(520px,calc(100vw - 30px));z-index:70}.toast.show{opacity:1;transform:none}.verify{position:fixed;inset:0;z-index:50;display:grid;place-items:center;background:rgba(3,8,15,.78);backdrop-filter:blur(18px)}.verify.hidden{display:none}.verifybox{width:min(520px,calc(100vw - 34px));padding:30px;border:1px solid rgba(151,210,255,.17);border-radius:26px;background:linear-gradient(145deg,rgba(21,40,65,.95),rgba(7,16,29,.97));box-shadow:0 40px 110px #000}.verifylogo{width:62px;height:62px;margin-bottom:24px}.verify h2{font-size:28px;letter-spacing:-.045em;margin:0 0 8px}.verify p{color:var(--muted);line-height:1.6;font-size:13px}.code{font:800 28px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.12em;margin:22px 0;padding:15px;text-align:center;border-radius:15px;background:rgba(117,242,208,.07);border:1px solid rgba(117,242,208,.18);color:#caffef}.wait{display:flex;gap:9px;align-items:center;font-size:12px;color:#bad0df}.spinner{width:13px;height:13px;border:2px solid rgba(255,255,255,.13);border-top-color:var(--a);border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
-@media(max-width:1000px){.shell{grid-template-columns:1fr}.side{display:none}.main{padding:24px 16px 60px}.grid{grid-template-columns:1fr}.arch{grid-template-columns:1fr;}.cross{height:42px;transform:rotate(90deg)}.form{grid-template-columns:1fr 1fr}.field.span4{grid-column:span 2}.sshgrid{grid-template-columns:1fr}.trow{grid-template-columns:1fr 1fr 1fr 1fr}.thead{display:none}}
-@media(max-width:620px){.form{grid-template-columns:1fr}.field.span2,.field.span4{grid-column:auto}.metrics{grid-template-columns:1fr}.top{display:block}.pill{display:inline-block;margin-top:10px}.trow{grid-template-columns:1fr 1fr}.actions .btn{flex:1}.sshgrid{padding:14px}}
-</style>
-</head>
-<body>
-<div class="verify" id="verify"><div class="verifybox"><div class="orb verifylogo"></div><div class="eyebrow">Terminal trust handshake</div><h2>Подтвердите браузер</h2><p>madUI не хранит sudo-пароль. Доступ выдаётся только после подтверждения этой вкладки в том же административном терминале.</p><div class="code" id="code">••••-••••</div><div class="wait"><span class="spinner"></span><span id="vtext">Создаём одноразовый запрос…</span></div></div></div>
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}body{overflow-x:hidden;background:radial-gradient(900px 600px at 12% -5%,rgba(78,112,255,.24),transparent 65%),radial-gradient(800px 620px at 95% 8%,rgba(255,77,174,.16),transparent 62%),radial-gradient(900px 700px at 55% 105%,rgba(54,229,194,.12),transparent 65%),#07101c}body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.28;background-image:linear-gradient(rgba(255,255,255,.025) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.025) 1px,transparent 1px);background-size:36px 36px;mask-image:linear-gradient(to bottom,black,transparent 92%)}
+.shell{display:grid;grid-template-columns:245px minmax(0,1fr);min-height:100vh}.side{position:sticky;top:0;height:100vh;padding:26px 18px;border-right:1px solid var(--line);background:rgba(5,12,22,.6);backdrop-filter:blur(24px)}.brand{display:flex;align-items:center;gap:12px;padding:3px 8px 28px}.orb{width:38px;height:38px;border-radius:14px;background:conic-gradient(from 215deg,var(--a),var(--b),var(--c),var(--a));box-shadow:0 0 42px rgba(117,242,208,.22);position:relative}.orb:after{content:"m";position:absolute;inset:3px;display:grid;place-items:center;border-radius:11px;background:#08111e;font-weight:900;font-size:22px}.brand b{font-size:20px;letter-spacing:-.04em}.brand span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.16em;margin-top:2px}.nav{display:grid;gap:7px}.nav button{all:unset;display:flex;align-items:center;gap:11px;padding:11px 12px;border-radius:12px;color:#91a9bb;cursor:pointer;font-size:13px}.nav button:hover,.nav button.active{color:#f4fbff;background:linear-gradient(90deg,rgba(117,242,208,.12),rgba(127,156,255,.08));box-shadow:inset 0 0 0 1px rgba(137,210,255,.09)}.doticon{width:8px;height:8px;border-radius:50%;border:1px solid currentColor}.nav button.active .doticon{background:var(--a);border-color:var(--a);box-shadow:0 0 18px var(--a)}.sidefoot{position:absolute;bottom:24px;left:18px;right:18px;padding:14px;border:1px solid var(--line);border-radius:14px;background:rgba(255,255,255,.025)}.sidefoot small,.muted{color:var(--muted)}.secure{margin-top:7px;color:var(--ok);font-size:12px}
+.main{padding:34px clamp(24px,4vw,58px) 70px;max-width:1600px;width:100%}.top{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:28px}.eyebrow{font-size:11px;letter-spacing:.18em;color:var(--a);text-transform:uppercase;font-weight:800}.top h1{font-size:clamp(34px,4.2vw,62px);letter-spacing:-.055em;line-height:.96;margin:8px 0 10px;background:linear-gradient(110deg,#fff 10%,#c9e2ff 52%,#9ff2dc);-webkit-background-clip:text;color:transparent}.sub{color:var(--muted);max-width:720px;line-height:1.6;font-size:14px}.pill,.servicepill{padding:9px 13px;border:1px solid rgba(113,246,181,.22);background:rgba(113,246,181,.07);border-radius:999px;color:var(--ok);font-size:12px;white-space:nowrap}.servicepill.off{border-color:rgba(255,211,109,.2);background:rgba(255,211,109,.07);color:var(--warn)}
+.grid{display:grid;grid-template-columns:1.35fr .85fr;gap:18px}.card{border:1px solid var(--line);background:linear-gradient(145deg,rgba(20,37,60,.77),rgba(8,18,31,.74));box-shadow:var(--shadow);border-radius:22px;backdrop-filter:blur(20px);overflow:hidden}.cardhead{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:19px 21px;border-bottom:1px solid rgba(255,255,255,.055)}.cardhead b{font-size:13px}.muted{font-size:12px}.arch{padding:24px;display:grid;grid-template-columns:1fr 90px 1fr;align-items:center;gap:14px;min-height:250px}.proxy{padding:18px;border:1px solid rgba(255,255,255,.1);border-radius:18px;background:rgba(5,15,27,.72);position:relative;overflow:hidden}.proxy:before{content:"";position:absolute;inset:-60% auto auto -20%;width:170px;height:170px;background:radial-gradient(circle,rgba(117,242,208,.15),transparent 68%)}.proxy.b:before{left:auto;right:-20%;background:radial-gradient(circle,rgba(255,133,200,.13),transparent 68%)}.proxy .role{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}.proxy h3{margin:8px 0 5px;font-size:19px}.mono{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#acd0e6;overflow-wrap:anywhere}.status{display:flex;align-items:center;gap:7px;margin-top:14px;color:var(--ok);font-size:11px}.status i{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 13px var(--ok)}.cross{position:relative;height:70px}.cross:before,.cross:after{content:"";position:absolute;left:0;right:0;top:34px;height:1px;background:linear-gradient(90deg,var(--a),var(--b),var(--c));box-shadow:0 0 16px rgba(127,156,255,.45)}.cross:after{transform:rotate(18deg)}.cross span{position:absolute;inset:0;display:grid;place-items:center;font-size:10px;color:#bdd4e4;z-index:1;text-shadow:0 2px 8px #07101c;background:radial-gradient(circle at center,#0b1727 0 19px,transparent 20px)}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:0 21px 21px}.metric{padding:15px;border:1px solid rgba(255,255,255,.06);background:rgba(255,255,255,.025);border-radius:15px}.metric small{color:var(--muted);display:block;font-size:10px;text-transform:uppercase;letter-spacing:.1em}.metric b{display:block;margin-top:7px;font-size:16px;overflow-wrap:anywhere}.modules{padding:13px 18px 19px}.module{display:flex;align-items:center;justify-content:space-between;padding:12px 2px;border-bottom:1px solid rgba(255,255,255,.05)}.module:last-child{border:0}.module strong{font-size:12px}.module span{font-size:11px;color:var(--muted)}.switch{width:34px;height:19px;border-radius:20px;background:rgba(117,242,208,.18);border:1px solid rgba(117,242,208,.25);position:relative}.switch:after{content:"";position:absolute;right:3px;top:3px;width:11px;height:11px;border-radius:50%;background:var(--a);box-shadow:0 0 12px var(--a)}
+.setup,.sshcard,.tunnelcard{grid-column:1/-1}.form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px;padding:21px}.field{display:grid;gap:7px}.field.span2{grid-column:span 2}.field label{font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:#829bb0}.field input,.field select{width:100%;border:1px solid rgba(147,199,255,.13);border-radius:12px;padding:11px 12px;background:rgba(2,9,17,.58);color:#eaf7ff;outline:none}.field input:focus,.field select:focus{border-color:rgba(117,242,208,.55);box-shadow:0 0 0 3px rgba(117,242,208,.07)}.actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:10px;padding:0 21px 21px}.btn{border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:11px 16px;background:rgba(255,255,255,.04);color:#c8dbe9;cursor:pointer;font-weight:700}.btn.primary{border:0;color:#06111b;background:linear-gradient(120deg,var(--a),#9cc7ff)}.btn.pink{border:0;color:#140914;background:linear-gradient(120deg,#ff9bd1,#b2a7ff)}.btn.danger{border-color:rgba(255,113,143,.28);color:#ff9bb0;background:rgba(255,113,143,.07)}.btn:disabled{opacity:.5;cursor:not-allowed}.sshgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:21px}.sshnode{padding:17px;border-radius:17px;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.025)}.sshnode h3{font-size:13px;margin:0 0 13px}.sshnode .fields{display:grid;gap:10px}.hint{font-size:11px;line-height:1.55;color:var(--muted);padding:0 21px 18px}.hint code{color:#bcebdc}.tunnels{padding:16px 21px 8px}.trow{display:grid;grid-template-columns:1.1fr .85fr .8fr 1.15fr .65fr 1.15fr .65fr auto auto;gap:8px;align-items:center;margin-bottom:8px}.trow input,.trow select{min-width:0;width:100%;border:1px solid rgba(147,199,255,.12);border-radius:10px;padding:9px;background:rgba(2,9,17,.58);color:#eaf7ff}.trow button{border:1px solid rgba(255,113,143,.22);background:rgba(255,113,143,.07);color:#ff9bb0;border-radius:10px;padding:9px 11px;cursor:pointer}.thead{font-size:9px;color:#7690a5;text-transform:uppercase;letter-spacing:.08em}.check{display:flex;justify-content:center}.check input{width:16px;height:16px}.toast{position:fixed;right:25px;bottom:25px;padding:13px 16px;border-radius:13px;background:#102338;border:1px solid var(--line);box-shadow:var(--shadow);opacity:0;transform:translateY(12px);pointer-events:none;transition:.25s;max-width:min(520px,calc(100vw - 30px));z-index:70}.toast.show{opacity:1;transform:none}.verify{position:fixed;inset:0;z-index:50;display:grid;place-items:center;background:rgba(3,8,15,.78);backdrop-filter:blur(18px)}.verify.hidden{display:none}.verifybox{width:min(520px,calc(100vw - 34px));padding:30px;border:1px solid rgba(151,210,255,.17);border-radius:26px;background:linear-gradient(145deg,rgba(21,40,65,.95),rgba(7,16,29,.97));box-shadow:0 40px 110px #000}.verifylogo{width:62px;height:62px;margin-bottom:24px}.verify h2{font-size:28px;letter-spacing:-.045em;margin:0 0 8px}.verify p{color:var(--muted);line-height:1.6;font-size:13px}.code{font:800 28px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.12em;margin:22px 0;padding:15px;text-align:center;border-radius:15px;background:rgba(117,242,208,.07);border:1px solid rgba(117,242,208,.18);color:#caffef}.wait{display:flex;gap:9px;align-items:center;font-size:12px;color:#bad0df}.spinner{width:13px;height:13px;border:2px solid rgba(255,255,255,.13);border-top-color:var(--a);border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:1000px){.shell{grid-template-columns:1fr}.side{display:none}.main{padding:24px 16px 60px}.grid{grid-template-columns:1fr}.arch{grid-template-columns:1fr}.cross{height:42px;transform:rotate(90deg)}.form{grid-template-columns:1fr 1fr}.sshgrid{grid-template-columns:1fr}.trow{grid-template-columns:1fr 1fr 1fr}.thead{display:none}}@media(max-width:620px){.form{grid-template-columns:1fr}.field.span2{grid-column:auto}.metrics{grid-template-columns:1fr}.top{display:block}.pill{display:inline-block;margin-top:10px}.trow{grid-template-columns:1fr 1fr}.actions .btn{flex:1}.sshgrid{padding:14px}}
+</style></head><body>
+<div class="verify" id="verify"><div class="verifybox"><div class="orb verifylogo"></div><div class="eyebrow">Terminal trust handshake</div><h2>Подтвердите браузер</h2><p>madUI не хранит sudo-пароль. Доступ выдаётся после подтверждения этой вкладки в том же административном терминале.</p><div class="code" id="code">••••-••••</div><div class="wait"><span class="spinner"></span><span id="vtext">Создаём одноразовый запрос…</span></div></div></div>
 <div class="shell"><aside class="side"><div class="brand"><div class="orb"></div><div><b>madUI</b><span>Mirror control plane</span></div></div><nav class="nav"><button class="active"><i class="doticon"></i>Обзор</button><button><i class="doticon"></i>Архитектура</button><button><i class="doticon"></i>SSH & Tunnels</button><button><i class="doticon"></i>Бэкапы</button><button><i class="doticon"></i>Failover</button><button><i class="doticon"></i>Безопасность</button></nav><div class="sidefoot"><small>Administrative session</small><div class="secure">● terminal verified</div></div></aside>
-<main class="main"><header class="top"><div><div class="eyebrow">madWebMirrorMagick</div><h1>Два Proxy.<br>Ноль одиночных точек.</h1><div class="sub">Primary и fallback Proxy взаимозаменяемы и одновременно служат bastion-маршрутами к приватным узлам за NAT. SSH-ключи раздельные, пароли первого подключения не сохраняются.</div></div><div class="pill">CONTROL PLANE ONLINE</div></header>
-<div class="grid">
-<section class="card"><div class="cardhead"><b>Dual Proxy ingress & management</b><span class="muted" id="hostName">loading…</span></div><div class="arch"><div class="proxy"><div class="role">Proxy A · preferred</div><h3 id="proxyAName">not configured</h3><div class="mono" id="proxyAKey">key —</div><div class="status"><i></i>failover route ready</div></div><div class="cross"><span>A ⇄ B</span></div><div class="proxy b"><div class="role">Proxy B · fallback</div><h3 id="proxyBName">not configured</h3><div class="mono" id="proxyBKey">key —</div><div class="status"><i></i>standby route ready</div></div></div><div class="metrics"><div class="metric"><small>Target</small><b id="metricTarget">—</b></div><div class="metric"><small>Transport</small><b id="metricTransport">direct</b></div><div class="metric"><small>Tunnel policy</small><b id="metricTunnels">0 groups</b></div></div></section>
-<section class="card"><div class="cardhead"><b>Модули</b><span class="muted">runtime</span></div><div class="modules"><div class="module"><div><strong>SSH key enrollment</strong><br><span>Ed25519 · terminal password handoff</span></div><div class="switch"></div></div><div class="module"><div><strong>Proxy A/B failover</strong><br><span>alternate jump paths</span></div><div class="switch"></div></div><div class="module"><div><strong>Tunnel supervisor</strong><br><span>same ID = failover group</span></div><div class="switch"></div></div><div class="module"><div><strong>Strict host keys</strong><br><span>no silent trust-on-first-use</span></div><div class="switch"></div></div></div></section>
-
-<section class="card setup"><div class="cardhead"><div><b>Сайт и target node</b><div class="muted" style="margin-top:4px">Базовые параметры зеркала и конечного приватного узла.</div></div><span class="muted" id="configPath"></span></div><form class="form" id="configForm"><div class="field"><label>Веб-сервер</label><select name="target_server" id="target_server"><option>nginx</option><option>apache2</option></select></div><div class="field"><label>Имя сайта</label><input name="server_name" id="server_name"></div><div class="field span2"><label>Локальный webroot</label><input name="local_site_dir" id="local_site_dir"></div><div class="field"><label>Target host</label><input name="remote_host" id="remote_host" placeholder="192.168.1.20"></div><div class="field"><label>SSH user</label><input name="remote_user" id="remote_user"></div><div class="field"><label>SSH port</label><input name="ssh_port" id="ssh_port" inputmode="numeric"></div><div class="field"><label>Proxy target</label><input name="proxy_target" id="proxy_target"></div><div class="field span2"><label>Remote webroot</label><input name="remote_site_dir" id="remote_site_dir"></div><div class="field span2"><label>Remote backup storage</label><input name="remote_backup_base" id="remote_backup_base"></div><div class="field"><label>Database</label><input name="db_name" id="db_name"></div><div class="field"><label>DB user</label><input name="db_user" id="db_user"></div><div class="field"><label>Backup time</label><input name="schedule_hhmm" id="schedule_hhmm" placeholder="04:00"></div><div class="field"><label>Health interval, sec</label><input name="health_interval_sec" id="health_interval_sec" inputmode="numeric"></div><div class="field span2"><label>Health URL</label><input name="health_url" id="health_url"></div><div class="field span2"><label>Host header</label><input name="health_host_header" id="health_host_header"></div></form></section>
-
-<section class="card sshcard"><div class="cardhead"><div><b>SSH connectivity</b><div class="muted" style="margin-top:4px">Direct, Proxy A, Proxy B — отдельные ключи и автоматический fallback.</div></div><span class="muted">NAT / LAN / Internet</span></div><div class="sshgrid"><div class="sshnode"><h3>Target identity</h3><div class="fields"><div class="field"><label>Transport mode</label><select name="ssh_transport" id="ssh_transport" form="configForm"><option value="direct">direct</option><option value="jump">jump</option><option value="auto">auto</option></select></div><div class="field"><label>Target private key</label><input name="ssh_identity_file" id="ssh_identity_file" form="configForm" placeholder="создастся автоматически"></div></div></div><div class="sshnode"><h3>Proxy A · preferred</h3><div class="fields"><div class="field"><label>[user@]host[:port]</label><input name="ssh_jump_primary" id="ssh_jump_primary" form="configForm" placeholder="madbackup@proxy-a.example.net:22"></div><div class="field"><label>Private key</label><input name="ssh_jump_primary_identity_file" id="ssh_jump_primary_identity_file" form="configForm" placeholder="/var/lib/madwebmirror/ssh/proxy-a"></div></div></div><div class="sshnode"><h3>Proxy B · fallback</h3><div class="fields"><div class="field"><label>[user@]host[:port]</label><input name="ssh_jump_fallback" id="ssh_jump_fallback" form="configForm" placeholder="madbackup@proxy-b.example.net:22"></div><div class="field"><label>Private key</label><input name="ssh_jump_fallback_identity_file" id="ssh_jump_fallback_identity_file" form="configForm" placeholder="/var/lib/madwebmirror/ssh/proxy-b"></div></div></div><div class="sshnode"><h3>Первичная привязка</h3><div class="muted" style="line-height:1.6">madUI создаст недостающие Ed25519 identities и запустит <code>ssh-copy-id</code>. Если сервер попросит пароль или подтверждение host key, ввод происходит <b>в терминале</b>, а не в браузере.</div><button class="btn pink" style="margin-top:14px" id="enrollBtn">Создать ключи и привязать узлы</button></div></div><div class="hint">Рекомендуемый домашний режим: <code>ssh_transport=jump</code>, target — приватный IP вебсервера, а Proxy A и Proxy B доступны снаружи и видят target по LAN.</div></section>
-
-<section class="card tunnelcard"><div class="cardhead"><div><b>SSH Tunnel Manager</b><div class="muted" style="margin-top:4px">Одинаковый ID на Proxy A и Proxy B — одна failover-группа. Одновременно работает только один маршрут.</div></div><span class="muted" id="tunnelPath"></span></div><div class="tunnels"><div class="trow thead"><span>ID</span><span>Proxy</span><span>Type</span><span>Bind host</span><span>Port</span><span>Target</span><span>Port</span><span>On</span></div><div id="tunnelRows"></div></div><div class="actions"><button class="btn" id="addTunnelBtn">+ Добавить маршрут</button><button class="btn" id="addPairBtn">+ Failover-пара A/B</button><button class="btn primary" id="saveTunnelsBtn">Сохранить tunnels</button></div><div class="hint">Supervisor запускается командой <code>madbackuper tunnels</code>. Следующим шагом мы посадим его на systemd под <code>madbackup</code>, чтобы туннели жили независимо от madUI.</div></section>
-
-<div class="actions" style="grid-column:1/-1;padding:0"><button class="btn" id="reloadBtn">Отменить изменения</button><button class="btn primary" id="saveBtn">Сохранить конфигурацию</button></div>
-</div></main></div><div class="toast" id="toast"></div>
+<main class="main"><header class="top"><div><div class="eyebrow">madWebMirrorMagick</div><h1>Два Proxy.<br>Ноль одиночных точек.</h1><div class="sub">Proxy A и Proxy B взаимозаменяемы и одновременно служат bastion-маршрутами к приватным узлам за NAT. SSH-ключи раздельные, пароли первого подключения не сохраняются.</div></div><div class="pill">CONTROL PLANE ONLINE</div></header>
+<div class="grid"><section class="card"><div class="cardhead"><b>Dual Proxy ingress & management</b><span class="muted" id="hostName">loading…</span></div><div class="arch"><div class="proxy"><div class="role">Proxy A · preferred</div><h3 id="proxyAName">not configured</h3><div class="mono" id="proxyAKey">key —</div><div class="status"><i></i>preferred route</div></div><div class="cross"><span>A ⇄ B</span></div><div class="proxy b"><div class="role">Proxy B · fallback</div><h3 id="proxyBName">not configured</h3><div class="mono" id="proxyBKey">key —</div><div class="status"><i></i>fallback route</div></div></div><div class="metrics"><div class="metric"><small>Target</small><b id="metricTarget">—</b></div><div class="metric"><small>Transport</small><b id="metricTransport">direct</b></div><div class="metric"><small>Tunnel policy</small><b id="metricTunnels">0 groups</b></div></div></section>
+<section class="card"><div class="cardhead"><b>Runtime</b><span class="servicepill off" id="serviceState">TUNNELS STOPPED</span></div><div class="modules"><div class="module"><div><strong>SSH key enrollment</strong><br><span>Ed25519 · terminal password handoff</span></div><div class="switch"></div></div><div class="module"><div><strong>Proxy A/B failover</strong><br><span>alternate jump paths</span></div><div class="switch"></div></div><div class="module"><div><strong>Tunnel supervisor</strong><br><span>systemd · User=madbackup</span></div><div class="switch"></div></div><div class="module"><div><strong>Shared host trust</strong><br><span>/var/lib/madwebmirror/.ssh/known_hosts</span></div><div class="switch"></div></div></div></section>
+<section class="card setup"><div class="cardhead"><div><b>Сайт и target node</b><div class="muted">Можно сохранять поэтапно; строгая проверка сайта выполняется перед backup/deploy.</div></div><span class="muted" id="configPath"></span></div><form class="form" id="configForm"><div class="field"><label>Веб-сервер</label><select name="target_server" id="target_server"><option>nginx</option><option>apache2</option></select></div><div class="field"><label>Имя сайта</label><input name="server_name" id="server_name"></div><div class="field span2"><label>Локальный webroot</label><input name="local_site_dir" id="local_site_dir"></div><div class="field"><label>Target host</label><input name="remote_host" id="remote_host" placeholder="192.168.1.20"></div><div class="field"><label>SSH user</label><input name="remote_user" id="remote_user"></div><div class="field"><label>SSH port</label><input name="ssh_port" id="ssh_port" inputmode="numeric"></div><div class="field"><label>Proxy target</label><input name="proxy_target" id="proxy_target"></div><div class="field span2"><label>Remote webroot</label><input name="remote_site_dir" id="remote_site_dir"></div><div class="field span2"><label>Remote backup storage</label><input name="remote_backup_base" id="remote_backup_base"></div><div class="field"><label>Database</label><input name="db_name" id="db_name"></div><div class="field"><label>DB user</label><input name="db_user" id="db_user"></div><div class="field"><label>Backup time</label><input name="schedule_hhmm" id="schedule_hhmm" placeholder="04:00"></div><div class="field"><label>Health interval, sec</label><input name="health_interval_sec" id="health_interval_sec" inputmode="numeric"></div><div class="field span2"><label>Health URL</label><input name="health_url" id="health_url"></div><div class="field span2"><label>Host header</label><input name="health_host_header" id="health_host_header"></div></form></section>
+<section class="card sshcard"><div class="cardhead"><div><b>SSH connectivity</b><div class="muted">Direct, Proxy A, Proxy B — отдельные ключи и автоматический fallback.</div></div><span class="muted">NAT / LAN / Internet</span></div><div class="sshgrid"><div class="sshnode"><h3>Target identity</h3><div class="fields"><div class="field"><label>Transport mode</label><select name="ssh_transport" id="ssh_transport" form="configForm"><option value="direct">direct</option><option value="jump">jump</option><option value="auto">auto</option></select></div><div class="field"><label>Target private key</label><input name="ssh_identity_file" id="ssh_identity_file" form="configForm" placeholder="создастся автоматически"></div></div></div><div class="sshnode"><h3>Proxy A · preferred</h3><div class="fields"><div class="field"><label>[user@]host[:port]</label><input name="ssh_jump_primary" id="ssh_jump_primary" form="configForm" placeholder="madbackup@proxy-a.example.net:22"></div><div class="field"><label>Private key</label><input name="ssh_jump_primary_identity_file" id="ssh_jump_primary_identity_file" form="configForm"></div></div></div><div class="sshnode"><h3>Proxy B · fallback</h3><div class="fields"><div class="field"><label>[user@]host[:port]</label><input name="ssh_jump_fallback" id="ssh_jump_fallback" form="configForm" placeholder="madbackup@proxy-b.example.net:22"></div><div class="field"><label>Private key</label><input name="ssh_jump_fallback_identity_file" id="ssh_jump_fallback_identity_file" form="configForm"></div></div></div><div class="sshnode"><h3>Первичная привязка</h3><div class="muted" style="line-height:1.6">Недостающие Ed25519 identities создаются автоматически. <code>ssh-copy-id</code> спрашивает пароль и fingerprint прямо в терминале, поэтому браузер их не получает.</div><button class="btn pink" style="margin-top:14px" id="enrollBtn">Создать ключи и привязать узлы</button></div></div><div class="hint">Домашний вариант: <code>ssh_transport=jump</code>, target — приватный IP вебсервера, Proxy A/B доступны извне и видят target по LAN.</div></section>
+<section class="card tunnelcard"><div class="cardhead"><div><b>SSH Tunnel Manager</b><div class="muted">Одинаковый ID на Proxy A и Proxy B — одна failover-группа; одновременно работает только один маршрут.</div></div><span class="muted" id="tunnelPath"></span></div><div class="tunnels"><div class="trow thead"><span>ID</span><span>Proxy</span><span>Type</span><span>Bind host</span><span>Port</span><span>Target</span><span>Port</span><span>On</span><span></span></div><div id="tunnelRows"></div></div><div class="actions"><button class="btn" id="addTunnelBtn">+ Маршрут</button><button class="btn" id="addPairBtn">+ Failover A/B</button><button class="btn primary" id="saveTunnelsBtn">Сохранить policy</button><button class="btn primary" id="startServiceBtn">Запустить</button><button class="btn" id="restartServiceBtn">Перезапустить</button><button class="btn danger" id="stopServiceBtn">Остановить</button></div><div class="hint">Policy root-owned, сервис работает непривилегированно как <code>madbackup</code>. Управление systemd идёт только через фиксированные verbs privileged helper-а.</div></section>
+<div class="actions" style="grid-column:1/-1;padding:0"><button class="btn" id="reloadBtn">Отменить изменения</button><button class="btn primary" id="saveBtn">Сохранить конфигурацию</button></div></div></main></div><div class="toast" id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);let reqId='';
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function toast(t,ok=true){const e=$('toast');e.textContent=t;e.style.borderColor=ok?'rgba(113,246,181,.28)':'rgba(255,113,143,.35)';e.classList.add('show');setTimeout(()=>e.classList.remove('show'),3600)}
 async function beginAuth(){try{const r=await fetch('/api/session/request',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'browser='+encodeURIComponent(navigator.userAgent)});const j=await r.json();reqId=j.request_id;$('code').textContent=j.code;$('vtext').textContent='Подтвердите этот код в sudo-терминале';pollAuth()}catch(e){$('vtext').textContent='Не удалось создать запрос: '+e}}
-async function pollAuth(){try{const r=await fetch('/api/session/status?id='+encodeURIComponent(reqId));const j=await r.json();if(j.state==='approved'){$('verify').classList.add('hidden');await Promise.all([loadConfig(),loadTunnels()]);return}if(j.state==='denied'||j.state==='expired'){$('vtext').textContent=j.state==='denied'?'Доступ отклонён в терминале':'Код истёк. Обновите страницу.';return}}catch(e){}setTimeout(pollAuth,700)}
+async function pollAuth(){try{const r=await fetch('/api/session/status?id='+encodeURIComponent(reqId));const j=await r.json();if(j.state==='approved'){$('verify').classList.add('hidden');await Promise.all([loadConfig(),loadTunnels(),loadService()]);return}if(j.state==='denied'||j.state==='expired'){$('vtext').textContent=j.state==='denied'?'Доступ отклонён в терминале':'Код истёк. Обновите страницу.';return}}catch(e){}setTimeout(pollAuth,700)}
 function put(id,v){const e=$(id);if(e)e.value=v??''}
 async function loadConfig(){const r=await fetch('/api/config');if(!r.ok){location.reload();return}const j=await r.json();Object.entries(j.config).forEach(([k,v])=>put(k,v));$('configPath').textContent=j.config_path;$('hostName').textContent=j.hostname;$('proxyAName').textContent=j.config.ssh_jump_primary||'not configured';$('proxyBName').textContent=j.config.ssh_jump_fallback||'not configured';$('proxyAKey').textContent='key '+(j.config.ssh_jump_primary_identity_file||'—');$('proxyBKey').textContent='key '+(j.config.ssh_jump_fallback_identity_file||'—');$('metricTarget').textContent=(j.config.remote_user||'user')+'@'+(j.config.remote_host||'—')+':'+j.config.ssh_port;$('metricTransport').textContent=j.config.ssh_transport||'direct'}
 function tunnelRow(t={id:'',route:'primary',direction:'local',bind_host:'127.0.0.1',bind_port:0,target_host:'',target_port:22,enabled:true}){const d=document.createElement('div');d.className='trow';d.innerHTML=`<input data-k="id" placeholder="web-admin" value="${esc(t.id)}"><select data-k="route"><option value="primary">Proxy A</option><option value="fallback">Proxy B</option></select><select data-k="direction"><option value="local">Local</option><option value="remote">Remote</option></select><input data-k="bind_host" value="${esc(t.bind_host||'127.0.0.1')}"><input data-k="bind_port" inputmode="numeric" value="${Number(t.bind_port)||''}"><input data-k="target_host" placeholder="192.168.1.20" value="${esc(t.target_host)}"><input data-k="target_port" inputmode="numeric" value="${Number(t.target_port)||22}"><div class="check"><input data-k="enabled" type="checkbox" ${t.enabled?'checked':''}></div><button title="Удалить">×</button>`;d.querySelector('[data-k=route]').value=t.route||'primary';d.querySelector('[data-k=direction]').value=t.direction||'local';d.querySelector('button').onclick=()=>d.remove();$('tunnelRows').appendChild(d);return d}
-function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function loadTunnels(){const r=await fetch('/api/tunnels');if(!r.ok)return;const j=await r.json();$('tunnelPath').textContent=j.path;$('tunnelRows').innerHTML='';(j.tunnels||[]).forEach(tunnelRow);const ids=new Set((j.tunnels||[]).filter(x=>x.enabled).map(x=>x.id));$('metricTunnels').textContent=ids.size+' groups'}
 function rowsPayload(){const lines=[];document.querySelectorAll('#tunnelRows .trow').forEach(r=>{const get=k=>r.querySelector(`[data-k=${k}]`);lines.push([get('id').value,get('route').value,get('direction').value,get('bind_host').value,get('bind_port').value,get('target_host').value,get('target_port').value,get('enabled').checked?'true':'false'].join('|'))});return lines.join('\n')}
-$('addTunnelBtn').onclick=e=>{e.preventDefault();tunnelRow()};$('addPairBtn').onclick=e=>{e.preventDefault();const id='tunnel-'+Math.random().toString(36).slice(2,7);tunnelRow({id,route:'primary',direction:'local',bind_host:'127.0.0.1',target_port:22,enabled:true});tunnelRow({id,route:'fallback',direction:'local',bind_host:'127.0.0.1',target_port:22,enabled:true})};
-$('saveTunnelsBtn').onclick=async e=>{e.preventDefault();const r=await fetch('/api/tunnels',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({rows:rowsPayload()})});let j={};try{j=await r.json()}catch{}if(r.ok){toast('Tunnel policy сохранена');loadTunnels()}else toast(j.error||'Ошибка tunnels',false)};
-$('saveBtn').onclick=async e=>{e.preventDefault();const body=new URLSearchParams(new FormData($('configForm')));const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});let j={};try{j=await r.json()}catch{}if(r.ok){toast('Конфигурация сохранена');loadConfig()}else toast(j.error||'Ошибка сохранения',false)};
-$('reloadBtn').onclick=e=>{e.preventDefault();loadConfig();loadTunnels();toast('Изменения отменены')};
-$('enrollBtn').onclick=async e=>{e.preventDefault();const b=$('enrollBtn');b.disabled=true;b.textContent='Смотрите терминал…';toast('Enrollment ждёт подтверждений/password в терминале');try{const r=await fetch('/api/enroll',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:''});let j={};try{j=await r.json()}catch{}if(r.ok){toast('SSH enrollment завершён');await loadConfig()}else toast(j.error||'Enrollment не завершён',false)}finally{b.disabled=false;b.textContent='Создать ключи и привязать узлы'}};
-beginAuth();
-</script>
-</body></html>)MADUI";
+async function loadService(){const r=await fetch('/api/tunnels/service');if(!r.ok)return;const j=await r.json();const e=$('serviceState');e.textContent=j.active?'TUNNELS ACTIVE':'TUNNELS STOPPED';e.classList.toggle('off',!j.active)}
+async function serviceAction(action){const r=await fetch('/api/tunnels/service',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({action})});let j={};try{j=await r.json()}catch{}if(r.ok){toast(action==='stop'?'Tunnel supervisor остановлен':'Tunnel supervisor '+(action==='start'?'запущен':'перезапущен'));await loadService()}else toast(j.error||'Ошибка tunnel service',false)}
+$('addTunnelBtn').onclick=e=>{e.preventDefault();tunnelRow()};$('addPairBtn').onclick=e=>{e.preventDefault();const id='tunnel-'+Math.random().toString(36).slice(2,7);const base={id,direction:'local',bind_host:'127.0.0.1',target_host:'',target_port:22,enabled:true};tunnelRow({...base,route:'primary'});tunnelRow({...base,route:'fallback'})};
+$('saveTunnelsBtn').onclick=async e=>{e.preventDefault();const r=await fetch('/api/tunnels',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({rows:rowsPayload()})});let j={};try{j=await r.json()}catch{}if(r.ok){toast(j.restarted?'Policy сохранена и supervisor перезапущен':'Tunnel policy сохранена');await Promise.all([loadTunnels(),loadService()])}else toast(j.error||'Ошибка tunnels',false)};
+$('startServiceBtn').onclick=e=>{e.preventDefault();serviceAction('start')};$('restartServiceBtn').onclick=e=>{e.preventDefault();serviceAction('restart')};$('stopServiceBtn').onclick=e=>{e.preventDefault();serviceAction('stop')};
+$('saveBtn').onclick=async e=>{e.preventDefault();const body=new URLSearchParams(new FormData($('configForm')));const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});let j={};try{j=await r.json()}catch{}if(r.ok){toast('Конфигурация сохранена');loadConfig()}else toast(j.error||'Ошибка сохранения',false)};$('reloadBtn').onclick=e=>{e.preventDefault();loadConfig();loadTunnels();loadService();toast('Изменения отменены')};
+$('enrollBtn').onclick=async e=>{e.preventDefault();const b=$('enrollBtn');b.disabled=true;b.textContent='Смотрите терминал…';toast('Enrollment ждёт password/fingerprint в терминале');try{const r=await fetch('/api/enroll',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:''});let j={};try{j=await r.json()}catch{}if(r.ok){toast('SSH enrollment завершён');await loadConfig()}else toast(j.error||'Enrollment не завершён',false)}finally{b.disabled=false;b.textContent='Создать ключи и привязать узлы'}};beginAuth();
+</script></body></html>)MADUI";
 }
 
 std::string config_json(const Config& c, const std::string& config_path, const std::string& host) {
     const auto ips = local_ipv4();
     const std::string ip = ips.empty() ? "127.0.0.1" : ips.front();
     std::ostringstream out;
-    out << "{\"hostname\":\"" << json_escape(host) << "\","
-        << "\"local_ip\":\"" << json_escape(ip) << "\","
-        << "\"config_path\":\"" << json_escape(config_path) << "\",\"config\":{"
+    out << "{\"hostname\":\"" << json_escape(host) << "\",\"local_ip\":\"" << json_escape(ip)
+        << "\",\"config_path\":\"" << json_escape(config_path) << "\",\"config\":{"
         << "\"target_server\":\"" << json_escape(c.target_server) << "\","
         << "\"server_name\":\"" << json_escape(c.server_name) << "\","
         << "\"local_site_dir\":\"" << json_escape(c.local_site_dir) << "\","
@@ -521,19 +533,15 @@ void approval_loop() {
             if (it == pending.end() || it->second.state != PendingBrowser::State::Pending) continue;
             snapshot = it->second;
         }
-
         std::cout << "\n\033[1;36m╭────────────────── madUI browser request ──────────────────╮\033[0m\n"
-                  << "  IP:      " << snapshot.ip << "\n"
-                  << "  Browser: " << snapshot.agent.substr(0, 110) << "\n"
-                  << "  Code:    \033[1;32m" << snapshot.code << "\033[0m\n"
+                  << "  IP:      " << snapshot.ip << "\n  Browser: " << snapshot.agent.substr(0, 110)
+                  << "\n  Code:    \033[1;32m" << snapshot.code << "\033[0m\n"
                   << "\033[1;36m╰────────────────────────────────────────────────────────────╯\033[0m\n"
                   << "Разрешить этому браузеру административный сеанс? [y/N] " << std::flush;
-
         std::string answer;
         if (!std::getline(std::cin, answer)) answer.clear();
         const std::string normalized = lower(trim(answer));
         const bool yes = normalized == "y" || normalized == "yes";
-
         std::lock_guard<std::mutex> lock(auth_mutex);
         auto it = pending.find(snapshot.id);
         if (it == pending.end() || it->second.state != PendingBrowser::State::Pending) continue;
@@ -553,280 +561,120 @@ void handle_client(int fd, const std::string& remote_ip, Config& cfg, std::mutex
                    const std::string& config_path, const std::string& host) {
     HttpRequest req;
     if (!read_request(fd, remote_ip, req)) {
-        respond(fd, 400, "application/json; charset=utf-8", "{\"error\":\"bad request\"}");
-        return;
+        respond(fd, 400, "application/json; charset=utf-8", "{\"error\":\"bad request\"}"); return;
     }
-
-    if (req.method == "GET" && req.path == "/") {
-        respond(fd, 200, "text/html; charset=utf-8", ui_html());
-        return;
-    }
+    if (req.method == "GET" && req.path == "/") { respond(fd, 200, "text/html; charset=utf-8", ui_html()); return; }
 
     if (req.method == "POST" && req.path == "/api/session/request") {
-        if (!same_origin(req)) {
-            respond(fd, 403, "application/json; charset=utf-8", "{\"error\":\"origin rejected\"}");
-            return;
-        }
+        if (!same_origin(req)) { respond(fd, 403, "application/json; charset=utf-8", "{\"error\":\"origin rejected\"}"); return; }
         const auto form = parse_form(req.body);
-        PendingBrowser p;
-        p.id = random_hex(20);
-        p.code = verification_code();
-        p.ip = req.remote_ip;
-        const auto browser = form.find("browser");
-        const auto ua = req.headers.find("user-agent");
+        PendingBrowser p; p.id = random_hex(20); p.code = verification_code(); p.ip = req.remote_ip;
+        const auto browser = form.find("browser"); const auto ua = req.headers.find("user-agent");
         p.agent = browser != form.end() ? browser->second : (ua != req.headers.end() ? ua->second : "unknown");
-        {
-            std::lock_guard<std::mutex> lock(auth_mutex);
-            expire_old_requests();
-            pending[p.id] = p;
-            approval_queue.push_back(p.id);
-        }
+        { std::lock_guard<std::mutex> lock(auth_mutex); expire_old_requests(); pending[p.id] = p; approval_queue.push_back(p.id); }
         auth_cv.notify_one();
-        respond(fd, 202, "application/json; charset=utf-8",
-                "{\"request_id\":\"" + p.id + "\",\"code\":\"" + p.code + "\"}");
-        return;
+        respond(fd, 202, "application/json; charset=utf-8", "{\"request_id\":\"" + p.id + "\",\"code\":\"" + p.code + "\"}"); return;
     }
-
     if (req.method == "GET" && req.path == "/api/session/status") {
-        const auto q = parse_query(req.query);
-        const auto qid = q.find("id");
-        if (qid == q.end()) {
-            respond(fd, 400, "application/json; charset=utf-8", "{\"error\":\"missing id\"}");
-            return;
-        }
-        std::lock_guard<std::mutex> lock(auth_mutex);
-        expire_old_requests();
-        const auto it = pending.find(qid->second);
-        if (it == pending.end()) {
-            respond(fd, 404, "application/json; charset=utf-8", "{\"state\":\"expired\"}");
-            return;
-        }
-        if (it->second.state == PendingBrowser::State::Approved) {
-            respond(fd, 200, "application/json; charset=utf-8", "{\"state\":\"approved\"}",
-                    {{"Set-Cookie", "madui_session=" + it->second.token + "; Path=/; HttpOnly; SameSite=Strict"}});
-        } else if (it->second.state == PendingBrowser::State::Denied) {
-            respond(fd, 200, "application/json; charset=utf-8", "{\"state\":\"denied\"}");
-        } else if (it->second.state == PendingBrowser::State::Expired) {
-            respond(fd, 200, "application/json; charset=utf-8", "{\"state\":\"expired\"}");
-        } else {
-            respond(fd, 200, "application/json; charset=utf-8", "{\"state\":\"pending\"}");
-        }
+        const auto q = parse_query(req.query); const auto qid = q.find("id");
+        if (qid == q.end()) { respond(fd, 400, "application/json; charset=utf-8", "{\"error\":\"missing id\"}"); return; }
+        std::lock_guard<std::mutex> lock(auth_mutex); expire_old_requests(); const auto it = pending.find(qid->second);
+        if (it == pending.end()) { respond(fd, 404, "application/json; charset=utf-8", "{\"state\":\"expired\"}"); return; }
+        if (it->second.state == PendingBrowser::State::Approved) respond(fd, 200, "application/json; charset=utf-8", "{\"state\":\"approved\"}", {{"Set-Cookie", "madui_session=" + it->second.token + "; Path=/; HttpOnly; SameSite=Strict"}});
+        else if (it->second.state == PendingBrowser::State::Denied) respond(fd, 200, "application/json; charset=utf-8", "{\"state\":\"denied\"}");
+        else if (it->second.state == PendingBrowser::State::Expired) respond(fd, 200, "application/json; charset=utf-8", "{\"state\":\"expired\"}");
+        else respond(fd, 200, "application/json; charset=utf-8", "{\"state\":\"pending\"}");
         return;
     }
 
-    if (!authorized(req)) {
-        respond(fd, 401, "application/json; charset=utf-8", "{\"error\":\"terminal verification required\"}");
-        return;
-    }
+    if (!authorized(req)) { respond(fd, 401, "application/json; charset=utf-8", "{\"error\":\"terminal verification required\"}"); return; }
 
     if (req.method == "GET" && req.path == "/api/config") {
-        std::lock_guard<std::mutex> lock(cfg_mutex);
-        respond(fd, 200, "application/json; charset=utf-8", config_json(cfg, config_path, host));
-        return;
+        std::lock_guard<std::mutex> lock(cfg_mutex); respond(fd, 200, "application/json; charset=utf-8", config_json(cfg, config_path, host)); return;
     }
-
     if (req.method == "POST" && req.path == "/api/config") {
-        if (!same_origin(req)) {
-            respond(fd, 403, "application/json; charset=utf-8", "{\"error\":\"origin rejected\"}");
-            return;
-        }
-        const auto form = parse_form(req.body);
-        std::lock_guard<std::mutex> lock(cfg_mutex);
-        Config next = cfg;
-        set_if_present(form, "target_server", next.target_server);
-        set_if_present(form, "server_name", next.server_name);
-        set_if_present(form, "local_site_dir", next.local_site_dir);
-        set_if_present(form, "remote_host", next.remote_host);
-        set_if_present(form, "remote_user", next.remote_user);
-        set_if_present(form, "ssh_transport", next.ssh_transport);
-        set_if_present(form, "ssh_identity_file", next.ssh_identity_file);
-        set_if_present(form, "ssh_jump_primary", next.ssh_jump_primary);
-        set_if_present(form, "ssh_jump_primary_identity_file", next.ssh_jump_primary_identity_file);
-        set_if_present(form, "ssh_jump_fallback", next.ssh_jump_fallback);
-        set_if_present(form, "ssh_jump_fallback_identity_file", next.ssh_jump_fallback_identity_file);
-        set_if_present(form, "proxy_target", next.proxy_target);
-        set_if_present(form, "remote_site_dir", next.remote_site_dir);
-        set_if_present(form, "remote_backup_base", next.remote_backup_base);
-        set_if_present(form, "db_name", next.db_name);
-        set_if_present(form, "db_user", next.db_user);
-        set_if_present(form, "schedule_hhmm", next.schedule_hhmm);
-        set_if_present(form, "health_url", next.health_url);
-        set_if_present(form, "health_host_header", next.health_host_header);
-        std::string err;
-        if (!parse_int_field(form, "ssh_port", next.ssh_port, err) ||
-            !parse_int_field(form, "health_interval_sec", next.health_interval_sec, err)) {
-            respond(fd, 400, "application/json; charset=utf-8", "{\"error\":\"" + json_escape(err) + "\"}");
-            return;
-        }
-        if (!validate(next, err)) {
-            respond(fd, 400, "application/json; charset=utf-8", "{\"error\":\"" + json_escape(err) + "\"}");
-            return;
-        }
-        try {
-            save_config(config_path, next);
-            cfg = next;
-            respond(fd, 200, "application/json; charset=utf-8", "{\"ok\":true}");
-        } catch (const std::exception& e) {
-            respond(fd, 500, "application/json; charset=utf-8", "{\"error\":\"" + json_escape(e.what()) + "\"}");
-        }
+        if (!same_origin(req)) { respond(fd, 403, "application/json; charset=utf-8", "{\"error\":\"origin rejected\"}"); return; }
+        const auto form = parse_form(req.body); std::lock_guard<std::mutex> lock(cfg_mutex); Config next = cfg;
+        set_if_present(form,"target_server",next.target_server); set_if_present(form,"server_name",next.server_name); set_if_present(form,"local_site_dir",next.local_site_dir);
+        set_if_present(form,"remote_host",next.remote_host); set_if_present(form,"remote_user",next.remote_user); set_if_present(form,"ssh_transport",next.ssh_transport);
+        set_if_present(form,"ssh_identity_file",next.ssh_identity_file); set_if_present(form,"ssh_jump_primary",next.ssh_jump_primary); set_if_present(form,"ssh_jump_primary_identity_file",next.ssh_jump_primary_identity_file);
+        set_if_present(form,"ssh_jump_fallback",next.ssh_jump_fallback); set_if_present(form,"ssh_jump_fallback_identity_file",next.ssh_jump_fallback_identity_file); set_if_present(form,"proxy_target",next.proxy_target);
+        set_if_present(form,"remote_site_dir",next.remote_site_dir); set_if_present(form,"remote_backup_base",next.remote_backup_base); set_if_present(form,"db_name",next.db_name); set_if_present(form,"db_user",next.db_user);
+        set_if_present(form,"schedule_hhmm",next.schedule_hhmm); set_if_present(form,"health_url",next.health_url); set_if_present(form,"health_host_header",next.health_host_header);
+        std::string err; if (!parse_int_field(form,"ssh_port",next.ssh_port,err) || !parse_int_field(form,"health_interval_sec",next.health_interval_sec,err)) { respond(fd,400,"application/json; charset=utf-8","{\"error\":\""+json_escape(err)+"\"}"); return; }
+        if (!validate_ui_config(next,err)) { respond(fd,400,"application/json; charset=utf-8","{\"error\":\""+json_escape(err)+"\"}"); return; }
+        try { save_config(config_path,next); cfg=next; respond(fd,200,"application/json; charset=utf-8","{\"ok\":true}"); }
+        catch(const std::exception& e){ respond(fd,500,"application/json; charset=utf-8","{\"error\":\""+json_escape(e.what())+"\"}"); }
         return;
     }
 
     if (req.method == "POST" && req.path == "/api/enroll") {
-        if (!same_origin(req)) {
-            respond(fd, 403, "application/json; charset=utf-8", "{\"error\":\"origin rejected\"}");
-            return;
-        }
-        std::unique_lock<std::mutex> enroll_lock(enrollment_mutex, std::try_to_lock);
-        if (!enroll_lock.owns_lock()) {
-            respond(fd, 409, "application/json; charset=utf-8", "{\"error\":\"enrollment already running\"}");
-            return;
-        }
+        if (!same_origin(req)) { respond(fd,403,"application/json; charset=utf-8","{\"error\":\"origin rejected\"}"); return; }
+        std::unique_lock<std::mutex> enroll_lock(enrollment_mutex,std::try_to_lock);
+        if (!enroll_lock.owns_lock()) { respond(fd,409,"application/json; charset=utf-8","{\"error\":\"enrollment already running\"}"); return; }
         std::lock_guard<std::mutex> cfg_lock(cfg_mutex);
-        const int rc = enroll_ssh_interactive(cfg, config_path);
-        if (rc == 0) respond(fd, 200, "application/json; charset=utf-8", "{\"ok\":true}");
-        else respond(fd, 500, "application/json; charset=utf-8", "{\"error\":\"SSH enrollment failed; see terminal\"}");
+        const int rc=enroll_ssh_interactive(cfg,config_path);
+        if(rc==0) respond(fd,200,"application/json; charset=utf-8","{\"ok\":true}"); else respond(fd,500,"application/json; charset=utf-8","{\"error\":\"SSH enrollment failed; see terminal\"}");
         return;
     }
 
     if (req.method == "GET" && req.path == "/api/tunnels") {
-        std::vector<ManagedTunnel> tunnels;
-        std::string err;
-        if (!load_tunnels(TUNNELS_PATH, tunnels, err)) {
-            respond(fd, 500, "application/json; charset=utf-8", "{\"error\":\"" + json_escape(err) + "\"}");
-            return;
-        }
-        respond(fd, 200, "application/json; charset=utf-8", tunnels_json(tunnels));
-        return;
+        std::vector<ManagedTunnel> tunnels; std::string err;
+        if(!load_tunnels(TUNNELS_PATH,tunnels,err)){respond(fd,500,"application/json; charset=utf-8","{\"error\":\""+json_escape(err)+"\"}");return;}
+        respond(fd,200,"application/json; charset=utf-8",tunnels_json(tunnels)); return;
     }
-
     if (req.method == "POST" && req.path == "/api/tunnels") {
-        if (!same_origin(req)) {
-            respond(fd, 403, "application/json; charset=utf-8", "{\"error\":\"origin rejected\"}");
-            return;
-        }
-        const auto form = parse_form(req.body);
-        const auto it = form.find("rows");
-        if (it == form.end()) {
-            respond(fd, 400, "application/json; charset=utf-8", "{\"error\":\"missing rows\"}");
-            return;
-        }
-        std::vector<ManagedTunnel> tunnels;
-        std::string err;
-        if (!parse_tunnel_rows(it->second, tunnels, err)) {
-            respond(fd, 400, "application/json; charset=utf-8", "{\"error\":\"" + json_escape(err) + "\"}");
-            return;
-        }
-        std::lock_guard<std::mutex> lock(cfg_mutex);
-        if (!validate_tunnels(cfg, tunnels, err)) {
-            respond(fd, 400, "application/json; charset=utf-8", "{\"error\":\"" + json_escape(err) + "\"}");
-            return;
-        }
-        if (!save_tunnels(TUNNELS_PATH, tunnels, err)) {
-            respond(fd, 500, "application/json; charset=utf-8", "{\"error\":\"" + json_escape(err) + "\"}");
-            return;
-        }
-        respond(fd, 200, "application/json; charset=utf-8", "{\"ok\":true}");
-        return;
+        if(!same_origin(req)){respond(fd,403,"application/json; charset=utf-8","{\"error\":\"origin rejected\"}");return;}
+        const auto form=parse_form(req.body); const auto it=form.find("rows"); if(it==form.end()){respond(fd,400,"application/json; charset=utf-8","{\"error\":\"missing rows\"}");return;}
+        std::vector<ManagedTunnel> tunnels; std::string err; if(!parse_tunnel_rows(it->second,tunnels,err)){respond(fd,400,"application/json; charset=utf-8","{\"error\":\""+json_escape(err)+"\"}");return;}
+        std::lock_guard<std::mutex> lock(cfg_mutex); if(!validate_tunnels(cfg,tunnels,err)){respond(fd,400,"application/json; charset=utf-8","{\"error\":\""+json_escape(err)+"\"}");return;}
+        if(!save_tunnels(TUNNELS_PATH,tunnels,err)){respond(fd,500,"application/json; charset=utf-8","{\"error\":\""+json_escape(err)+"\"}");return;}
+        const bool was_active=tunnel_service_active(); bool restarted=false;
+        if(was_active && has_enabled_tunnel(tunnels)){restarted=helper_verb("tunnels-restart")==0;}
+        respond(fd,200,"application/json; charset=utf-8",std::string("{\"ok\":true,\"restarted\":")+(restarted?"true":"false")+"}"); return;
     }
 
-    respond(fd, 404, "application/json; charset=utf-8", "{\"error\":\"not found\"}");
+    if (req.method == "GET" && req.path == "/api/tunnels/service") {
+        respond(fd,200,"application/json; charset=utf-8",std::string("{\"active\":")+(tunnel_service_active()?"true":"false")+"}"); return;
+    }
+    if (req.method == "POST" && req.path == "/api/tunnels/service") {
+        if(!same_origin(req)){respond(fd,403,"application/json; charset=utf-8","{\"error\":\"origin rejected\"}");return;}
+        const auto form=parse_form(req.body); const auto it=form.find("action"); if(it==form.end()){respond(fd,400,"application/json; charset=utf-8","{\"error\":\"missing action\"}");return;}
+        std::vector<ManagedTunnel> tunnels; std::string err; if(!load_tunnels(TUNNELS_PATH,tunnels,err)){respond(fd,500,"application/json; charset=utf-8","{\"error\":\""+json_escape(err)+"\"}");return;}
+        const std::string action=it->second; const char* verb=nullptr;
+        if(action=="start"){if(!has_enabled_tunnel(tunnels)){respond(fd,400,"application/json; charset=utf-8","{\"error\":\"Нет включённых tunnel routes\"}");return;}verb="tunnels-enable";}
+        else if(action=="restart"){if(!has_enabled_tunnel(tunnels)){respond(fd,400,"application/json; charset=utf-8","{\"error\":\"Нет включённых tunnel routes\"}");return;}verb="tunnels-restart";}
+        else if(action=="stop") verb="tunnels-disable";
+        else {respond(fd,400,"application/json; charset=utf-8","{\"error\":\"unknown action\"}");return;}
+        if(helper_verb(verb)!=0){respond(fd,500,"application/json; charset=utf-8","{\"error\":\"privileged helper failed\"}");return;}
+        respond(fd,200,"application/json; charset=utf-8","{\"ok\":true}"); return;
+    }
+
+    respond(fd,404,"application/json; charset=utf-8","{\"error\":\"not found\"}");
 }
 
 int bind_listener(const UiOptions& options) {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) throw std::runtime_error(std::string("socket: ") + std::strerror(errno));
-    int yes = 1;
-    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<std::uint16_t>(options.port));
-    if (::inet_pton(AF_INET, options.bind.c_str(), &addr.sin_addr) != 1) {
-        ::close(fd);
-        throw std::runtime_error("madUI пока принимает IPv4 bind-адрес, например 0.0.0.0 или 127.0.0.1");
-    }
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        const std::string e = std::strerror(errno);
-        ::close(fd);
-        throw std::runtime_error("bind " + options.bind + ":" + std::to_string(options.port) + ": " + e);
-    }
-    if (::listen(fd, 32) != 0) {
-        const std::string e = std::strerror(errno);
-        ::close(fd);
-        throw std::runtime_error("listen: " + e);
-    }
-    return fd;
+    const int fd=::socket(AF_INET,SOCK_STREAM,0); if(fd<0) throw std::runtime_error(std::string("socket: ")+std::strerror(errno)); int yes=1; ::setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof(yes));
+    sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_port=htons(static_cast<std::uint16_t>(options.port));
+    if(::inet_pton(AF_INET,options.bind.c_str(),&addr.sin_addr)!=1){::close(fd);throw std::runtime_error("madUI пока принимает IPv4 bind-адрес");}
+    if(::bind(fd,reinterpret_cast<sockaddr*>(&addr),sizeof(addr))!=0){const std::string e=std::strerror(errno);::close(fd);throw std::runtime_error("bind "+options.bind+":"+std::to_string(options.port)+": "+e);}
+    if(::listen(fd,32)!=0){const std::string e=std::strerror(errno);::close(fd);throw std::runtime_error("listen: "+e);} return fd;
 }
 
 void print_banner(const UiOptions& options) {
-    const auto ips = local_ipv4();
-    const char* sudo_user = std::getenv("SUDO_USER");
-    std::cout << "\n\033[1;35m"
-              << "   __  __           ______  __  __  ____\n"
-              << "  / /_/ /__  ___   / __/ / / / / / /  _/\n"
-              << " / __/ / _ \\/ _ \\ / _// /_/ / /_/ // /\n"
-              << " \\__/_/\\___/_//_//___/\\____/\\____/___/  madUI\n"
-              << "\033[0m\n"
-              << "Административный терминал: " << (sudo_user && *sudo_user ? sudo_user : "root") << " (euid=0)\n"
-              << "madUI слушает " << options.bind << ':' << options.port << "\n\n"
-              << "Откройте в браузере:\n";
-    if (options.bind == "127.0.0.1") {
-        std::cout << "  \033[1;36mhttp://127.0.0.1:" << options.port << "/\033[0m\n";
-    } else {
-        if (ips.empty()) std::cout << "  \033[1;36mhttp://" << hostname() << ':' << options.port << "/\033[0m\n";
-        for (const auto& ip : ips) std::cout << "  \033[1;36mhttp://" << ip << ':' << options.port << "/\033[0m\n";
-    }
-    std::cout << "\nПосле открытия страницы здесь появится одноразовый код.\n"
-              << "Подтвердите его клавишей y. SSH enrollment также использует этот терминал.\n"
-              << "Ctrl+C завершает административный сеанс и инвалидирует browser-session.\n\n";
+    const auto ips=local_ipv4(); const char* sudo_user=std::getenv("SUDO_USER");
+    std::cout<<"\n\033[1;35m   madWebMirrorMagick · madUI\033[0m\n"<<"Административный терминал: "<<(sudo_user&&*sudo_user?sudo_user:"root")<<" (euid=0)\n"<<"madUI слушает "<<options.bind<<':'<<options.port<<"\n\nОткройте в браузере:\n";
+    if(options.bind=="127.0.0.1") std::cout<<"  \033[1;36mhttp://127.0.0.1:"<<options.port<<"/\033[0m\n"; else {if(ips.empty())std::cout<<"  \033[1;36mhttp://"<<hostname()<<':'<<options.port<<"/\033[0m\n";for(const auto& ip:ips)std::cout<<"  \033[1;36mhttp://"<<ip<<':'<<options.port<<"/\033[0m\n";}
+    std::cout<<"\nПосле открытия страницы здесь появится одноразовый код.\nSSH enrollment также использует этот терминал. Ctrl+C завершает madUI.\n\n";
 }
 
 } // namespace
 
-int run_ui(Config cfg, const std::string& config_path, const UiOptions& options) {
-    if (::geteuid() != 0) {
-        std::cerr << "❌ madUI должен запускаться из административного терминала.\n"
-                  << "   Используйте: sudo madwebmirror ui\n"
-                  << "   sudo-пароль используется только самим sudo и приложению не передаётся.\n";
-        return 1;
-    }
-    if (!::isatty(STDIN_FILENO)) {
-        std::cerr << "❌ madUI требует интерактивный TTY для browser verification и SSH enrollment.\n";
-        return 1;
-    }
-    if (options.port <= 0 || options.port > 65535) {
-        std::cerr << "❌ ui-port должен быть в диапазоне 1..65535\n";
-        return 1;
-    }
-
-    int listen_fd = -1;
-    try { listen_fd = bind_listener(options); }
-    catch (const std::exception& e) {
-        std::cerr << "❌ Не удалось запустить madUI: " << e.what() << '\n';
-        return 1;
-    }
-
-    print_banner(options);
-    std::thread(approval_loop).detach();
-    std::mutex cfg_mutex;
-    const std::string host = hostname();
-
-    for (;;) {
-        sockaddr_storage addr{};
-        socklen_t len = sizeof(addr);
-        const int client = ::accept(listen_fd, reinterpret_cast<sockaddr*>(&addr), &len);
-        if (client < 0) {
-            if (errno == EINTR) continue;
-            std::cerr << "❌ accept: " << std::strerror(errno) << '\n';
-            continue;
-        }
-        const std::string ip = peer_ip(addr);
-        std::thread([client, ip, &cfg, &cfg_mutex, config_path, host] {
-            handle_client(client, ip, cfg, cfg_mutex, config_path, host);
-            ::close(client);
-        }).detach();
-    }
+int run_ui(Config cfg,const std::string& config_path,const UiOptions& options){
+    if(::geteuid()!=0){std::cerr<<"❌ madUI должен запускаться: sudo madwebmirror ui\n";return 1;} if(!::isatty(STDIN_FILENO)){std::cerr<<"❌ madUI требует интерактивный TTY.\n";return 1;} if(options.port<=0||options.port>65535){std::cerr<<"❌ ui-port должен быть 1..65535\n";return 1;}
+    int listen_fd=-1; try{listen_fd=bind_listener(options);}catch(const std::exception& e){std::cerr<<"❌ Не удалось запустить madUI: "<<e.what()<<'\n';return 1;}
+    print_banner(options); std::thread(approval_loop).detach(); std::mutex cfg_mutex; const std::string host=hostname();
+    for(;;){sockaddr_storage addr{};socklen_t len=sizeof(addr);const int client=::accept(listen_fd,reinterpret_cast<sockaddr*>(&addr),&len);if(client<0){if(errno==EINTR)continue;std::cerr<<"❌ accept: "<<std::strerror(errno)<<'\n';continue;}const std::string ip=peer_ip(addr);std::thread([client,ip,&cfg,&cfg_mutex,config_path,host]{handle_client(client,ip,cfg,cfg_mutex,config_path,host);::close(client);}).detach();}
 }
 
 } // namespace mad
