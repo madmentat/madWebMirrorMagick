@@ -7,6 +7,8 @@
 #include "mad/backup.hpp"
 #include "mad/core.hpp"
 #include "mad/daemon.hpp"
+#include "mad/enroll.hpp"
+#include "mad/tunnels.hpp"
 #include "mad/ui.hpp"
 
 namespace fs = std::filesystem;
@@ -18,6 +20,8 @@ enum class Action {
     BackupDaemon,
     Monitor,
     Ui,
+    Enroll,
+    Tunnels,
     Install,
     Uninstall,
     Help
@@ -31,6 +35,8 @@ Action parse_action(int argc, char** argv) {
         if (arg == "--daemon-uninstall" || arg == "uninstall") return Action::Uninstall;
         if (arg == "--monitor" || arg == "monitor") return Action::Monitor;
         if (arg == "ui" || arg == "--ui" || arg == "madui") return Action::Ui;
+        if (arg == "enroll" || arg == "ssh-enroll") return Action::Enroll;
+        if (arg == "tunnels" || arg == "tunnel-supervisor") return Action::Tunnels;
         if (arg == "--daemon") return Action::BackupDaemon;
         if (arg == "backup") return Action::Backup;
     }
@@ -44,6 +50,15 @@ std::string explicit_config_path(int argc, char** argv) {
         if (arg.rfind(prefix, 0) == 0) return arg.substr(std::char_traits<char>::length(prefix));
     }
     return {};
+}
+
+std::string explicit_tunnels_path(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        constexpr const char* prefix = "--tunnels=";
+        if (arg.rfind(prefix, 0) == 0) return arg.substr(std::char_traits<char>::length(prefix));
+    }
+    return mad::TUNNELS_PATH;
 }
 
 mad::UiOptions ui_options(int argc, char** argv) {
@@ -80,6 +95,8 @@ void print_help() {
   madbackuper --daemon               Плановый backup по schedule_hhmm
   madbackuper monitor                Health monitor / failover
   sudo madbackuper ui                Интерактивная панель madUI
+  sudo madbackuper enroll            Создать SSH keys и выполнить первый ssh-copy-id
+  madbackuper tunnels                Supervisor SSH-туннелей Proxy A/Proxy B
   madbackuper install                Установить systemd backup timer + remote watchdog
   madbackuper uninstall              Удалить сервисы
 
@@ -90,6 +107,20 @@ madUI:
   получает доступ только после подтверждения [y/N] в том же sudo-терминале.
   Sudo/root пароль приложение не получает и не сохраняет.
 
+SSH transport:
+  --ssh-transport=direct|jump|auto
+  --ssh-identity-file=/var/lib/madwebmirror/ssh/target-node
+  --ssh-jump-primary=madbackup@proxy-a.example.net:22
+  --ssh-jump-primary-identity-file=/var/lib/madwebmirror/ssh/proxy-a
+  --ssh-jump-fallback=madbackup@proxy-b.example.net:22
+  --ssh-jump-fallback-identity-file=/var/lib/madwebmirror/ssh/proxy-b
+
+Tunnel manager:
+  madbackuper tunnels --tunnels=/etc/madwebmirror/tunnels.conf
+
+  Одинаковый tunnel id для primary/fallback образует failover-группу: активен
+  один SSH forward, а при его падении supervisor переключается на второй Proxy.
+
 Общие параметры:
   --config=/path/to/file
   --remote-host=...
@@ -98,7 +129,8 @@ madUI:
   --skip-tar --skip-sql --skip-upload
   --schedule=HH:MM
 
-SSH host key обязан уже находиться в known_hosts. Сначала проверьте отпечаток сервера.
+SSH host key должен быть проверен. Enrollment использует OpenSSH host-key prompt;
+пароли первого подключения вводятся непосредственно в терминал и не сохраняются.
 )";
 }
 
@@ -151,6 +183,21 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Enrollment тоже должен работать до полной настройки сайта/БД.
+    if (action == Action::Enroll) {
+        if (cfg.remote_host.empty() || cfg.remote_user.empty() || cfg.ssh_port <= 0 || cfg.ssh_port > 65535) {
+            std::cerr << "❌ Для enrollment нужны remote_host, remote_user и корректный ssh_port.\n";
+            return 1;
+        }
+        return mad::enroll_ssh_interactive(cfg, cfg_path);
+    }
+
+    // Tunnel supervisor зависит только от SSH Proxy-профилей и tunnels.conf,
+    // а не от готовности web/db backup-конфигурации.
+    if (action == Action::Tunnels) {
+        return mad::run_tunnel_supervisor(cfg, explicit_tunnels_path(argc, argv));
+    }
+
     std::string validation_error;
     if (!mad::validate(cfg, validation_error)) {
         std::cerr << "❌ Ошибка параметров: " << validation_error
@@ -165,6 +212,8 @@ int main(int argc, char** argv) {
         case Action::Install:      return mad::daemon_install(cfg);
         case Action::Uninstall:    return mad::daemon_uninstall(cfg);
         case Action::Ui:
+        case Action::Enroll:
+        case Action::Tunnels:
         case Action::Help:         break;
     }
     return 1;
