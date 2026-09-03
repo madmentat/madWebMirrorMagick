@@ -4,6 +4,7 @@
 #include <pwd.h>
 
 #include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -16,6 +17,7 @@ namespace {
 
 constexpr const char* kServiceUser = "madbackup";
 constexpr const char* kSiteRoot = "/srv/madwebmirror/sites";
+constexpr const char* kTunnelUnit = "madwebmirror-tunnels.service";
 
 bool safe_token(const std::string& s, std::size_t max_len = 64) {
     if (s.empty() || s.size() > max_len) return false;
@@ -179,6 +181,22 @@ int route_apache(const std::string& site_id, const std::string& server_name,
     return std::system("systemctl reload apache2") == 0 ? 0 : 1;
 }
 
+int tunnels_enable() {
+    return std::system("systemctl enable --now madwebmirror-tunnels.service") == 0 ? 0 : 1;
+}
+
+int tunnels_disable() {
+    return std::system("systemctl disable --now madwebmirror-tunnels.service") == 0 ? 0 : 1;
+}
+
+int tunnels_restart() {
+    return std::system("systemctl restart madwebmirror-tunnels.service") == 0 ? 0 : 1;
+}
+
+int tunnels_status() {
+    return std::system("systemctl is-active --quiet madwebmirror-tunnels.service") == 0 ? 0 : 3;
+}
+
 void usage() {
     std::cerr
         << "Usage:\n"
@@ -186,7 +204,11 @@ void usage() {
         << "  madweb-helper route-nginx SITE_ID SERVER_NAME BACKEND_HOST PORT\n"
         << "  madweb-helper route-apache SITE_ID SERVER_NAME BACKEND_HOST PORT\n"
         << "  madweb-helper nginx-reload\n"
-        << "  madweb-helper apache-reload\n";
+        << "  madweb-helper apache-reload\n"
+        << "  madweb-helper tunnels-enable\n"
+        << "  madweb-helper tunnels-disable\n"
+        << "  madweb-helper tunnels-restart\n"
+        << "  madweb-helper tunnels-status\n";
 }
 
 } // namespace
@@ -201,6 +223,10 @@ int main(int argc, char** argv) {
     if (cmd == "route-apache" && argc == 6) return route_apache(argv[2], argv[3], argv[4], argv[5]);
     if (cmd == "nginx-reload" && argc == 2) return std::system("nginx -t && systemctl reload nginx") == 0 ? 0 : 1;
     if (cmd == "apache-reload" && argc == 2) return std::system("apache2ctl configtest && systemctl reload apache2") == 0 ? 0 : 1;
+    if (cmd == "tunnels-enable" && argc == 2) return tunnels_enable();
+    if (cmd == "tunnels-disable" && argc == 2) return tunnels_disable();
+    if (cmd == "tunnels-restart" && argc == 2) return tunnels_restart();
+    if (cmd == "tunnels-status" && argc == 2) return tunnels_status();
 
     usage();
     return 2;
