@@ -1,354 +1,299 @@
-#include <string>
-#include <cstdint>
-#include <filesystem>
-#include <chrono>
-#include <iostream>
-#include <vector>
-#include <fstream>
-#include <type_traits>
-#include <cstdlib>
-#include <cstdio>
-#include <ctime>
-
 #include "mad/core.hpp"
+
+#include <sys/stat.h>
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <type_traits>
 
 namespace mad {
 
-// ───────── Константы (определения extern из core.hpp) ─────────
-const char* CFG_PATH_PRIMARY         = "/etc/madbackuper.conf";
-const char* CFG_PATH_FALLBACK        = "/root/madbackuper.conf";
-const char* DEFAULT_TARGET           = "nginx";      // или "apache2"
-const int   DEFAULT_SSH_PORT         = 22;
-const int   DEFAULT_LOCAL_HTTP_PORT  = 8081;
-const int   DEFAULT_LOCAL_HTTPS_PORT = 0;
-const bool  DEFAULT_SWITCH_TO_LOCAL  = true;
-const std::string DEFAULT_PHP_VERSION = "8.3";
-// NEW: дефолт для health-check интервала
-const int   DEFAULT_HEALTH_INTERVAL_SEC = 60;
-
-// ───────── base64 encoder ─────────
-static const char B64_TABLE[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-std::string base64_encode(const std::string &in) {
-    std::string out;
-    size_t i = 0;
-    unsigned char a3[3]{};
-    unsigned char a4[4]{};
-    for (unsigned char c : in) {
-        a3[i++] = c;
-        if (i == 3) {
-            a4[0] = (a3[0] & 0xfc) >> 2;
-            a4[1] = ((a3[0] & 0x03) << 4) + ((a3[1] & 0xf0) >> 4);
-            a4[2] = ((a3[1] & 0x0f) << 2) + ((a3[2] & 0xc0) >> 6);
-            a4[3] = a3[2] & 0x3f;
-            for (int j = 0; j < 4; j++) out.push_back(B64_TABLE[a4[j]]);
-            i = 0;
-        }
-    }
-    if (i) {
-        for (size_t j = i; j < 3; j++) a3[j] = '\0';
-        a4[0] = (a3[0] & 0xfc) >> 2;
-        a4[1] = ((a3[0] & 0x03) << 4) + ((a3[1] & 0xf0) >> 4);
-        a4[2] = ((a3[1] & 0x0f) << 2) + ((a3[2] & 0xc0) >> 6);
-        a4[3] = a3[2] & 0x3f;
-        for (size_t j = 0; j < i + 1; j++) out.push_back(B64_TABLE[a4[j]]);
-        while ((i++ < 3)) out.push_back('=');
-    }
-    return out;
-}
-
-// ───────── Вспомогалки ─────────
 std::string trim(const std::string& s) {
-    auto l = s.find_first_not_of(" \t\r\n");
-    auto r = s.find_last_not_of(" \t\r\n");
+    const auto l = s.find_first_not_of(" \t\r\n");
     if (l == std::string::npos) return {};
+    const auto r = s.find_last_not_of(" \t\r\n");
     return s.substr(l, r - l + 1);
 }
 
-std::string today() {
-    char buf[16];
+static std::string format_local_time(const char* format) {
     std::time_t t = std::time(nullptr);
     std::tm tm{};
     localtime_r(&t, &tm);
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm);
-    return std::string(buf);
-}
-
-std::string human_size(uint64_t bytes) {
-    const char* u[] = {"B","KB","MB","GB","TB","PB"};
-    double v = static_cast<double>(bytes);
-    int i = 0;
-    while (v >= 1024.0 && i < 5) { v /= 1024.0; ++i; }
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "%.1f %s", v, u[i]);
+    char buf[64]{};
+    std::strftime(buf, sizeof(buf), format, &tm);
     return buf;
 }
 
-// В header объявлено с std::filesystem::path — соблюдаем сигнатуру
-uint64_t dir_size_bytes(const std::filesystem::path& root) {
-    uint64_t total = 0;
+std::string today() {
+    return format_local_time("%Y-%m-%d");
+}
+
+std::string timestamp() {
+    return format_local_time("%Y%m%d-%H%M%S");
+}
+
+std::string human_size(std::uint64_t bytes) {
+    static constexpr const char* units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
+    double value = static_cast<double>(bytes);
+    std::size_t unit = 0;
+    while (value >= 1024.0 && unit + 1 < std::size(units)) {
+        value /= 1024.0;
+        ++unit;
+    }
+    char buf[64]{};
+    std::snprintf(buf, sizeof(buf), "%.1f %s", value, units[unit]);
+    return buf;
+}
+
+std::uint64_t dir_size_bytes(const fs::path& root) {
+    std::uint64_t total = 0;
     std::error_code ec;
-    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
-         it != end; ++it) {
-        if (ec) { ec.clear(); continue; }
-        std::error_code ec2;
-        if (fs::is_regular_file(*it, ec2)) total += fs::file_size(*it, ec2);
+    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+    const fs::recursive_directory_iterator end;
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        std::error_code file_ec;
+        if (it->is_regular_file(file_ec)) {
+            const auto size = it->file_size(file_ec);
+            if (!file_ec) total += static_cast<std::uint64_t>(size);
+        }
     }
     return total;
 }
 
+std::string shell_quote(const std::string& value) {
+    std::string out{"'"};
+    out.reserve(value.size() + 8);
+    for (const char c : value) {
+        if (c == '\'') out += "'\\''";
+        else out.push_back(c);
+    }
+    out.push_back('\'');
+    return out;
+}
+
 bool has_command(const char* name) {
-    std::string cmd = std::string("command -v ") + name + " >/dev/null 2>&1";
+    const std::string cmd = "command -v " + shell_quote(name) + " >/dev/null 2>&1";
     return std::system(cmd.c_str()) == 0;
 }
 
-// ───────── Конфиг I/O ─────────
-static const char CFG_HEADER[] =
-R"(# madbackuper.conf
-# ------------------------------------------------------------
-# Конфигурация для madbackuper (автогенерируется при первом запуске).
-# Все параметры можно переопределить CLI-ключами.
-# ------------------------------------------------------------
-# Основные параметры:
-#   target_server=nginx            # допустимо: nginx | apache2
-#   remote_host=192.168.88.202
-#   ssh_port=22
-#   remote_user=madmentat
-#   remote_pass=XXX           # пароль для SSH-подключения пользователя
-#   remote_sudo_pass=              # пароль, который спрашивает sudo; если пусто — берётся remote_pass
-#   remote_root_pass=              # пароль для root (на будущее)
-# Пути:
-#   local_site_dir=/webserver/madmentat.ru   # локально: что архивируем
-#   remote_site_dir=/webserver/madmentat.ru  # удалённо: куда разворачиваем
-#   remote_backup_base=/webserver/.backup    # удалённо: где хранить бэкапы
-#
-# Веб-название:
-#   server_name=madmentat.ru
-#
-# PHP:
-#   php_version=8.3
-#   # или:
-#   # php_fpm_sock=/run/php/php8.3-fpm.sock
-#
-# База:
-#   db_user=madmentat
-#   db_pass=XXX
-#   db_name=mad
-#
-# Прокси/переключение (nginx):
-#   proxy_target=192.168.88.198
-#   local_http_port=8081 - этот порт будет использован для конфигурации сервера на удаленном хосте
-#   local_https_port=0
-#
-#   health_url= "http://127.0.0.1:80/" - адрес и порт для проверки статуса локального вебсервера
-#   switch_to_local=true
-#   ssl_cert=/path/to/cert.crt
-#   ssl_key=/path/to/key.key
-#
-# Планировщик:
-#   schedule_hhmm=04:00
-#   health_interval_sec=60
-#
-# Примеры:
-#   ./madbackuper --target-server=nginx --switch-to-local=true
-#   ./madbackuper --skip-tar
-#   ./madbackuper --skip-upload
-#   ./madbackuper --daemon --at=03:00
-# ------------------------------------------------------------
-)";
+int run_local(const std::string& cmd, bool echo) {
+    if (echo) std::cout << "➜ " << cmd << '\n';
+    const int rc = std::system(cmd.c_str());
+    if (rc != 0) std::cerr << "❌ Команда завершилась с кодом " << rc << '\n';
+    return rc;
+}
+
+static bool parse_bool(const std::string& value) {
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
+static int parse_int(const std::string& value, const std::string& key) {
+    try {
+        std::size_t used = 0;
+        const int result = std::stoi(value, &used);
+        if (used != value.size()) throw std::invalid_argument("tail");
+        return result;
+    } catch (const std::exception&) {
+        throw std::runtime_error("Некорректное целое значение для " + key + ": " + value);
+    }
+}
+
+bool parse_hhmm(const std::string& value, int& hh, int& mm) {
+    if (value.size() != 5 || value[2] != ':') return false;
+    try {
+        hh = std::stoi(value.substr(0, 2));
+        mm = std::stoi(value.substr(3, 2));
+    } catch (...) {
+        return false;
+    }
+    return hh >= 0 && hh < 24 && mm >= 0 && mm < 60;
+}
 
 void write_default_config(const std::string& path) {
-    std::ofstream out(path);
-    out << CFG_HEADER
-        << "target_server="       << DEFAULT_TARGET             << "\n"
-        << "remote_host="         << "192.168.88.202"           << "\n"
-        << "ssh_port="            << DEFAULT_SSH_PORT           << "\n"
-        << "remote_user="         << "madmentat"                << "\n"
-        << "remote_pass="         << "XXX"                 << "\n"
-        << "remote_root_pass="    << "XXX"                 << "\n"
-        << "remote_sudo_pass="    << ""                         << "\n"
-        << "local_site_dir="      << "/webserver/madmentat.ru"  << "\n"
-        << "remote_site_dir="     << "/webserver/madmentat.ru"  << "\n"
-        << "remote_backup_base="  << "/webserver/.backup"       << "\n"
-        << "server_name="         << "madmentat.ru"             << "\n"
-        << "php_version="         << DEFAULT_PHP_VERSION        << "\n"
-        << "php_fpm_sock="        << ""                         << "\n"
-        << "db_user="             << "madmentat"                << "\n"
-        << "db_pass="             << "XXX"                 << "\n"
-        << "db_name="             << "mad"                      << "\n"
-        << "proxy_target="        << "192.168.88.198"           << "\n"
-        << "local_http_port="     << DEFAULT_LOCAL_HTTP_PORT    << "\n"
-        << "local_https_port="    << DEFAULT_LOCAL_HTTPS_PORT   << "\n"
-        << "health_url="          << "http://127.0.0.1:80/"     << "\n"
-        << "health_host_header="  << ""                         << "\n"
-        << "switch_to_local="     << "true"                     << "\n"
-        << "ssl_cert="            << ""                         << "\n"
-        << "ssl_key="             << ""                         << "\n"
-        << "health_interval_sec=" << DEFAULT_HEALTH_INTERVAL_SEC<< "\n"
-        << "schedule_hhmm="       << "04:00"                    << "\n";
+    const fs::path p(path);
+    if (p.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(p.parent_path(), ec);
+    }
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) throw std::runtime_error("Не удалось создать конфиг: " + path);
+
+    out << R"(# madbackuper.conf
+# Пароли допускаются для совместимости, но предпочтительна SSH-аутентификация ключом.
+# Файл автоматически создаётся с правами 0600.
+
+target_server=nginx
+remote_host=192.168.88.202
+ssh_port=22
+remote_user=madbackup
+remote_pass=
+remote_sudo_pass=
+
+local_site_dir=/webserver/madmentat.ru
+remote_site_dir=/webserver/madmentat.ru
+remote_backup_base=/webserver/.backup
+
+server_name=madmentat.ru
+# Если пусто, используется /root/setup_<первая часть server_name>_nginx.sh
+switch_script=
+
+php_version=8.3
+php_fpm_sock=
+
+db_user=madmentat
+db_pass=
+db_name=mad
+
+proxy_target=192.168.88.198
+local_http_port=8081
+local_https_port=0
+switch_to_local=true
+
+health_url=http://127.0.0.1:80/
+health_host_header=
+health_interval_sec=60
+health_failures=3
+health_recoveries=3
+switch_cooldown_sec=60
+
+ssl_cert=
+ssl_key=
+
+schedule_hhmm=04:00
+)";
     out.close();
+    if (::chmod(path.c_str(), 0600) != 0) {
+        throw std::runtime_error("Не удалось установить права 0600 на конфиг: " + path);
+    }
+}
+
+static void assign_config_value(Config& cfg, const std::string& key, const std::string& value) {
+    if      (key == "target_server")         cfg.target_server = value;
+    else if (key == "remote_host")           cfg.remote_host = value;
+    else if (key == "ssh_port")              cfg.ssh_port = parse_int(value, key);
+    else if (key == "remote_user")           cfg.remote_user = value;
+    else if (key == "remote_pass")           cfg.remote_pass = value;
+    else if (key == "remote_sudo_pass")      cfg.remote_sudo_pass = value;
+    else if (key == "local_site_dir")        cfg.local_site_dir = value;
+    else if (key == "remote_site_dir")       cfg.remote_site_dir = value;
+    else if (key == "remote_backup_base")    cfg.remote_backup_base = value;
+    else if (key == "server_name")           cfg.server_name = value;
+    else if (key == "switch_script")         cfg.switch_script = value;
+    else if (key == "php_version")           cfg.php_version = value;
+    else if (key == "php_fpm_sock")          cfg.php_fpm_sock = value;
+    else if (key == "db_user")               cfg.db_user = value;
+    else if (key == "db_pass")               cfg.db_pass = value;
+    else if (key == "db_name")               cfg.db_name = value;
+    else if (key == "proxy_target")          cfg.proxy_target = value;
+    else if (key == "local_http_port")       cfg.local_http_port = parse_int(value, key);
+    else if (key == "local_https_port")      cfg.local_https_port = parse_int(value, key);
+    else if (key == "switch_to_local")       cfg.switch_to_local = parse_bool(value);
+    else if (key == "health_url")            cfg.health_url = value;
+    else if (key == "health_host_header")    cfg.health_host_header = value;
+    else if (key == "health_interval_sec")   cfg.health_interval_sec = parse_int(value, key);
+    else if (key == "health_failures")       cfg.health_failures = parse_int(value, key);
+    else if (key == "health_recoveries")     cfg.health_recoveries = parse_int(value, key);
+    else if (key == "switch_cooldown_sec")   cfg.switch_cooldown_sec = parse_int(value, key);
+    else if (key == "ssl_cert")              cfg.ssl_cert = value;
+    else if (key == "ssl_key")               cfg.ssl_key = value;
+    else if (key == "schedule_hhmm")         cfg.schedule_hhmm = value;
 }
 
 void load_kv_file(const std::string& path, Config& cfg) {
     std::ifstream in(path);
-    if (!in) return;
+    if (!in) throw std::runtime_error("Не удалось открыть конфиг: " + path);
+
     std::string line;
+    std::size_t line_no = 0;
     while (std::getline(in, line)) {
+        ++line_no;
         line = trim(line);
-        if (line.empty() || line[0]=='#' || line[0]==';') continue;
-        auto eq = line.find('=');
+        if (line.empty() || line.front() == '#' || line.front() == ';') continue;
+        const auto eq = line.find('=');
         if (eq == std::string::npos) continue;
-        auto k = trim(line.substr(0, eq));
-        auto v = trim(line.substr(eq+1));
-
-        if      (k=="target_server")        cfg.target_server = v;
-        else if (k=="remote_host")          cfg.remote_host = v;
-        else if (k=="ssh_port")             cfg.ssh_port = std::stoi(v);
-        else if (k=="remote_user")          cfg.remote_user = v;
-        else if (k=="remote_pass")          cfg.remote_pass = v;
-        else if (k=="remote_root_pass")     cfg.remote_root_pass = v;
-        else if (k=="remote_sudo_pass")     cfg.remote_sudo_pass = v;
-        else if (k=="local_site_dir")       cfg.local_site_dir = v;
-        else if (k=="remote_site_dir")      cfg.remote_site_dir = v;
-        else if (k=="remote_backup_base")   cfg.remote_backup_base = v;
-        else if (k=="server_name")          cfg.server_name = v;
-        else if (k=="php_version")          cfg.php_version = v;
-        else if (k=="php_fpm_sock")         cfg.php_fpm_sock = v;
-        else if (k=="db_user")              cfg.db_user = v;
-        else if (k=="db_pass")              cfg.db_pass = v;
-        else if (k=="db_name")              cfg.db_name = v;
-        else if (k=="proxy_target")         cfg.proxy_target = v;
-        else if (k=="local_http_port")      cfg.local_http_port = std::stoi(v);
-        else if (k=="local_https_port")     cfg.local_https_port = std::stoi(v);
-        else if (k=="health_url")           cfg.health_url = v;
-        else if (k=="health_host_header")   cfg.health_host_header = v;
-        else if (k=="switch_to_local")      cfg.switch_to_local = (v=="true"||v=="1"||v=="yes");
-        else if (k=="ssl_cert")             cfg.ssl_cert = v;
-        else if (k=="ssl_key")              cfg.ssl_key = v;
-        else if (k=="health_interval_sec")  cfg.health_interval_sec = std::stoi(v);
-        else if (k=="schedule_hhmm")        cfg.schedule_hhmm = v;
-    }
-}
-
-// внутренний парсер HH:MM (для --at=)
-static bool parse_hhmm(const std::string& s, int& hh, int& mm) {
-    if (s.size()!=5 || s[2]!=':') return false;
-    try { hh=std::stoi(s.substr(0,2)); mm=std::stoi(s.substr(3,2)); } catch(...) { return false; }
-    return (0<=hh && hh<24) && (0<=mm && mm<60);
-}
-
-// «расширенная» версия (с поддержкой daemon и --at)
-void apply_cli_kv(int argc, char** argv, Config& cfg,
-                  bool& daemon_mode, int& alarm_h, int& alarm_m) {
-    auto eat = [&](const std::string& arg, const char* key, auto& dst) {
-        std::string p = std::string("--") + key + "=";
-        if (arg.rfind(p, 0) == 0) {
-            std::string val = arg.substr(p.size());
-            if constexpr(std::is_same_v<decltype(dst), int&>)  dst = std::stoi(val);
-            else if constexpr(std::is_same_v<decltype(dst), bool&>) dst = (val=="true"||val=="1"||val=="yes");
-            else dst = val;
-            return true;
-        }
-        return false;
-    };
-
-    for (int i=1; i<argc; ++i) {
-        std::string a = argv[i];
-        // key=value
-        if (eat(a, "target-server",        cfg.target_server))        continue;
-        if (eat(a, "remote-host",          cfg.remote_host))          continue;
-        if (eat(a, "ssh-port",             cfg.ssh_port))             continue;
-        if (eat(a, "remote-user",          cfg.remote_user))          continue;
-        if (eat(a, "remote-pass",          cfg.remote_pass))          continue;
-        if (eat(a, "remote-root-pass",     cfg.remote_root_pass))     continue;
-        if (eat(a, "remote-sudo-pass",     cfg.remote_sudo_pass))     continue;
-        if (eat(a, "local-site-dir",       cfg.local_site_dir))       continue;
-        if (eat(a, "remote-site-dir",      cfg.remote_site_dir))      continue;
-        if (eat(a, "remote-backup-base",   cfg.remote_backup_base))   continue;
-        if (eat(a, "server-name",          cfg.server_name))          continue;
-        if (eat(a, "php-version",          cfg.php_version))          continue;
-        if (eat(a, "php-fpm-sock",         cfg.php_fpm_sock))         continue;
-        if (eat(a, "db-user",              cfg.db_user))              continue;
-        if (eat(a, "db-pass",              cfg.db_pass))              continue;
-        if (eat(a, "db-name",              cfg.db_name))              continue;
-        if (eat(a, "proxy-target",         cfg.proxy_target))         continue;
-        if (eat(a, "local-http-port",      cfg.local_http_port))      continue;
-        if (eat(a, "local-https-port",     cfg.local_https_port))     continue;
-        if (eat(a, "health-url",           cfg.health_url))           continue;
-        if (eat(a, "health-host-header",   cfg.health_host_header))   continue;
-        if (eat(a, "switch-to-local",      cfg.switch_to_local))      continue;
-        if (eat(a, "ssl-cert",             cfg.ssl_cert))             continue;
-        if (eat(a, "ssl-key",              cfg.ssl_key))              continue;
-        if (eat(a, "health-interval-sec",  cfg.health_interval_sec))  continue;
-        if (eat(a, "schedule",             cfg.schedule_hhmm))        continue;
-
-        // флаги
-        if (a=="--skip-tar")    { cfg.skip_tar = true;    continue; }
-        if (a=="--skip-sql")    { cfg.skip_sql = true;    continue; }
-        if (a=="--skip-upload") { cfg.skip_upload = true; continue; }
-        if (a=="--daemon")      { daemon_mode = true;     continue; }
-        if (a.rfind("--at=",0)==0){
-            std::string v = a.substr(5);
-            if (!parse_hhmm(v, alarm_h, alarm_m)) {
-                std::cerr << "❌ Неверный формат --at=HH:MM\n";
-                std::exit(1);
-            }
-            continue;
+        const auto key = trim(line.substr(0, eq));
+        const auto value = trim(line.substr(eq + 1));
+        try {
+            assign_config_value(cfg, key, value);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(path + ":" + std::to_string(line_no) + ": " + e.what());
         }
     }
 }
 
-// «короткая» версия (совместимость с вызовами без демона)
 void apply_cli_kv(int argc, char** argv, Config& cfg) {
-    bool dummy_daemon = false; int dummy_h=0, dummy_m=0;
-    apply_cli_kv(argc, argv, cfg, dummy_daemon, dummy_h, dummy_m);
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--skip-tar")    { cfg.skip_tar = true; continue; }
+        if (arg == "--skip-sql")    { cfg.skip_sql = true; continue; }
+        if (arg == "--skip-upload") { cfg.skip_upload = true; continue; }
+
+        const auto eq = arg.find('=');
+        if (arg.rfind("--", 0) != 0 || eq == std::string::npos) continue;
+
+        std::string key = arg.substr(2, eq - 2);
+        const std::string value = arg.substr(eq + 1);
+        for (char& c : key) if (c == '-') c = '_';
+        if (key == "at" || key == "schedule") key = "schedule_hhmm";
+        assign_config_value(cfg, key, value);
+    }
 }
 
-// ───────── Проверка параметров ─────────
-bool validate(const Config& c, std::string& err) {
-    auto notEmpty = [&](const std::string& v, const char* name)->bool {
-        if (v.empty()) { err = std::string("Параметр пуст: ") + name; return false; }
+bool validate(const Config& cfg, std::string& err) {
+    const auto required = [&](const std::string& value, const char* name) {
+        if (value.empty()) {
+            err = std::string("Параметр пуст: ") + name;
+            return false;
+        }
         return true;
     };
-    if (!(c.target_server=="nginx" || c.target_server=="apache2")) { err = "target_server: nginx|apache2"; return false; }
-    if (!notEmpty(c.remote_host, "remote_host")) return false;
-    if (!notEmpty(c.remote_user, "remote_user")) return false;
-    if (!notEmpty(c.remote_pass, "remote_pass")) return false;
-    if (!notEmpty(c.local_site_dir, "local_site_dir")) return false;
-    if (!notEmpty(c.remote_site_dir, "remote_site_dir")) return false;
-    if (!notEmpty(c.remote_backup_base, "remote_backup_base")) return false;
-    if (!notEmpty(c.server_name, "server_name")) return false;
-    if (c.php_fpm_sock.empty() && !notEmpty(c.php_version, "php_version")) return false;
-    if (!notEmpty(c.db_user, "db_user")) return false;
-    if (!notEmpty(c.db_pass, "db_pass")) return false;
-    if (!notEmpty(c.db_name, "db_name")) return false;
-    if (!notEmpty(c.proxy_target, "proxy_target")) return false;
-    if (c.local_http_port <= 0 || c.local_http_port == 80 || c.local_http_port == 443) { err = "local_http_port >0 и не 80/443"; return false; }
-    if (c.local_https_port > 0) {
-        if (!notEmpty(c.ssl_cert, "ssl_cert")) return false;
-        if (!notEmpty(c.ssl_key, "ssl_key")) return false;
-        if (c.local_https_port == 80 || c.local_https_port == 443 || c.local_https_port == c.local_http_port) {
-            err = "local_https_port >0, не 80/443 и ≠ local_http_port"; return false;
-        }
+
+    if (cfg.target_server != "nginx" && cfg.target_server != "apache2") {
+        err = "target_server должен быть nginx или apache2";
+        return false;
+    }
+    if (!required(cfg.remote_host, "remote_host")) return false;
+    if (!required(cfg.remote_user, "remote_user")) return false;
+    if (!required(cfg.local_site_dir, "local_site_dir")) return false;
+    if (!required(cfg.remote_site_dir, "remote_site_dir")) return false;
+    if (!required(cfg.remote_backup_base, "remote_backup_base")) return false;
+    if (!required(cfg.server_name, "server_name")) return false;
+    if (!required(cfg.db_user, "db_user")) return false;
+    if (!required(cfg.db_name, "db_name")) return false;
+    if (!required(cfg.proxy_target, "proxy_target")) return false;
+
+    if (cfg.ssh_port <= 0 || cfg.ssh_port > 65535) {
+        err = "ssh_port должен быть в диапазоне 1..65535";
+        return false;
+    }
+    if (cfg.local_http_port <= 0 || cfg.local_http_port > 65535) {
+        err = "local_http_port должен быть в диапазоне 1..65535";
+        return false;
+    }
+    if (cfg.local_https_port < 0 || cfg.local_https_port > 65535) {
+        err = "local_https_port должен быть в диапазоне 0..65535";
+        return false;
+    }
+    if (cfg.health_interval_sec < 5 || cfg.health_failures < 1 || cfg.health_recoveries < 1 || cfg.switch_cooldown_sec < 0) {
+        err = "Некорректные параметры health-check";
+        return false;
+    }
+    int hh = 0, mm = 0;
+    if (!parse_hhmm(cfg.schedule_hhmm, hh, mm)) {
+        err = "schedule_hhmm должен иметь формат HH:MM";
+        return false;
     }
     return true;
 }
-
-// ───────────────── run_local / run_with_spinner ─────────────────
-int run_local(const std::string& cmd, bool echo) {
-    if (echo) {
-        std::cout << "➜ " << cmd << std::endl;
-    }
-    // std::system возвращает код завершения шелла; для простоты вернём его как есть
-    return std::system(cmd.c_str());
-}
-
-// Если где-то остались вызовы "со спиннером" — пусть просто делегирует в run_local
-int run_with_spinner(const std::string& cmd, const std::string& /*label*/) {
-    return run_local(cmd, /*echo=*/true);
-}
-
-
 
 } // namespace mad
