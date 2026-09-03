@@ -12,6 +12,11 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <vector>
+
+#include <libssh/callbacks.h>
+
+#include "mad/transport.hpp"
 
 namespace mad {
 namespace {
@@ -56,9 +61,41 @@ bool verify_known_host(ssh_session session, std::string& err) {
     return false;
 }
 
-} // namespace
+struct JumpAuthContext {
+    std::string identity_file;
+    std::string error;
+};
 
-ssh_session ssh_connect_authenticated(const Config& cfg, std::string& err) {
+int jump_before_connection(ssh_session session, void* userdata) {
+    auto* ctx = static_cast<JumpAuthContext*>(userdata);
+    if (!ctx || ctx->identity_file.empty()) return SSH_OK;
+    if (ssh_options_set(session, SSH_OPTIONS_IDENTITY, ctx->identity_file.c_str()) != SSH_OK) {
+        ctx->error = std::string("Не удалось настроить ключ jump-host: ") + ssh_get_error(session);
+        return SSH_ERROR;
+    }
+    return SSH_OK;
+}
+
+int jump_verify_knownhost(ssh_session session, void* userdata) {
+    auto* ctx = static_cast<JumpAuthContext*>(userdata);
+    std::string error;
+    if (verify_known_host(session, error)) return SSH_OK;
+    if (ctx) ctx->error = "Jump-host: " + error;
+    return SSH_ERROR;
+}
+
+int jump_authenticate(ssh_session session, void* userdata) {
+    auto* ctx = static_cast<JumpAuthContext*>(userdata);
+    const int auth = ssh_userauth_publickey_auto(session, nullptr, nullptr);
+    if (auth == SSH_AUTH_SUCCESS) return SSH_OK;
+    if (ctx) ctx->error = std::string("Аутентификация ключом на jump-host не удалась: ") + ssh_get_error(session);
+    return SSH_ERROR;
+}
+
+ssh_session connect_one(const Config& cfg,
+                        const std::string& proxy_jump,
+                        const std::string& jump_identity,
+                        std::string& err) {
     err.clear();
     ssh_session session = ssh_new();
     if (!session) {
@@ -72,8 +109,34 @@ ssh_session ssh_connect_authenticated(const Config& cfg, std::string& err) {
     ssh_options_set(session, SSH_OPTIONS_USER, cfg.remote_user.c_str());
     ssh_options_set(session, SSH_OPTIONS_PORT, &cfg.ssh_port);
 
+    if (!cfg.ssh_identity_file.empty()) {
+        if (ssh_options_set(session, SSH_OPTIONS_IDENTITY, cfg.ssh_identity_file.c_str()) != SSH_OK) {
+            err = std::string("Не удалось настроить SSH identity: ") + ssh_get_error(session);
+            ssh_free(session);
+            return nullptr;
+        }
+    }
+
+    JumpAuthContext jump_ctx;
+    ssh_jump_callbacks_struct jump_cb{};
+    if (!proxy_jump.empty()) {
+        jump_ctx.identity_file = jump_identity;
+        jump_cb.userdata = &jump_ctx;
+        jump_cb.before_connection = jump_before_connection;
+        jump_cb.verify_knownhost = jump_verify_knownhost;
+        jump_cb.authenticate = jump_authenticate;
+
+        if (ssh_options_set(session, SSH_OPTIONS_PROXYJUMP, proxy_jump.c_str()) != SSH_OK ||
+            ssh_options_set(session, SSH_OPTIONS_PROXYJUMP_CB_LIST_APPEND, &jump_cb) != SSH_OK) {
+            err = std::string("Не удалось настроить ProxyJump ") + proxy_jump + ": " + ssh_get_error(session);
+            ssh_free(session);
+            return nullptr;
+        }
+    }
+
     if (ssh_connect(session) != SSH_OK) {
-        err = std::string("ssh_connect: ") + ssh_get_error(session);
+        if (!jump_ctx.error.empty()) err = jump_ctx.error;
+        else err = std::string("ssh_connect: ") + ssh_get_error(session);
         ssh_free(session);
         return nullptr;
     }
@@ -95,6 +158,56 @@ ssh_session ssh_connect_authenticated(const Config& cfg, std::string& err) {
         return nullptr;
     }
     return session;
+}
+
+} // namespace
+
+ssh_session ssh_connect_authenticated(const Config& cfg, std::string& err) {
+    err.clear();
+
+    TransportProfile profile;
+    try {
+        profile = transport_profile_from_config(cfg);
+    } catch (const std::exception& e) {
+        err = e.what();
+        return nullptr;
+    }
+    if (!validate_transport_profile(profile, err)) return nullptr;
+
+    struct Attempt {
+        std::string label;
+        std::string proxy_jump;
+        std::string jump_identity;
+    };
+    std::vector<Attempt> attempts;
+
+    if (profile.mode == SshTransportMode::Direct || profile.mode == SshTransportMode::Auto) {
+        attempts.push_back({"direct", {}, {}});
+    }
+    if (profile.mode == SshTransportMode::Jump || profile.mode == SshTransportMode::Auto) {
+        for (const auto& route : profile.jump_routes) {
+            attempts.push_back({route.id, route.proxy_jump, route.identity_file});
+        }
+    }
+
+    std::string last_error;
+    for (const auto& attempt : attempts) {
+        std::string attempt_error;
+        ssh_session session = connect_one(cfg, attempt.proxy_jump, attempt.jump_identity, attempt_error);
+        if (session) {
+            if (attempt.label != "direct") {
+                std::cout << "🔐 SSH route: " << attempt.label << " (" << attempt.proxy_jump << ")\n";
+            }
+            return session;
+        }
+        last_error = attempt.label + ": " + attempt_error;
+        if (attempts.size() > 1) {
+            std::cerr << "⚠️ SSH route " << attempt.label << " недоступен: " << attempt_error << '\n';
+        }
+    }
+
+    err = last_error.empty() ? "Не удалось построить SSH-маршрут" : last_error;
+    return nullptr;
 }
 
 void ssh_disconnect_and_free(ssh_session session) {
