@@ -1,11 +1,34 @@
 #include "mad/core.hpp"
 
+#include <pwd.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <fstream>
 #include <stdexcept>
 
 namespace mad {
+namespace {
+
+void apply_config_permissions(const std::string& path) {
+    const bool system_config = path.rfind("/etc/", 0) == 0;
+    const mode_t mode = system_config ? 0640 : 0600;
+    if (::chmod(path.c_str(), mode) != 0) {
+        throw std::runtime_error("Не удалось установить права на конфиг: " + path);
+    }
+
+    // System services run as madbackup and need read-only access to the same
+    // configuration. Secrets remain unavailable to other users.
+    if (system_config && ::geteuid() == 0) {
+        if (passwd* pw = ::getpwnam("madbackup")) {
+            if (::chown(path.c_str(), 0, pw->pw_gid) != 0) {
+                throw std::runtime_error("Не удалось установить root:madbackup на конфиг: " + path);
+            }
+        }
+    }
+}
+
+} // namespace
 
 void save_config(const std::string& path, const Config& cfg) {
     const fs::path p(path);
@@ -62,9 +85,11 @@ void save_config(const std::string& path, const Config& cfg) {
     if (!out) throw std::runtime_error("Ошибка записи конфигурации: " + tmp);
     out.close();
 
-    if (::chmod(tmp.c_str(), 0600) != 0) {
+    try {
+        apply_config_permissions(tmp);
+    } catch (...) {
         fs::remove(tmp);
-        throw std::runtime_error("Не удалось установить права 0600 на временный конфиг");
+        throw;
     }
 
     std::error_code ec;
@@ -73,9 +98,7 @@ void save_config(const std::string& path, const Config& cfg) {
         fs::remove(tmp);
         throw std::runtime_error("Не удалось заменить конфигурацию: " + ec.message());
     }
-    if (::chmod(path.c_str(), 0600) != 0) {
-        throw std::runtime_error("Конфиг записан, но не удалось установить права 0600: " + path);
-    }
+    apply_config_permissions(path);
 }
 
 } // namespace mad
