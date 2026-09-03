@@ -1,7 +1,7 @@
 CXX      ?= g++
 CPPFLAGS := -Iinclude
-CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
-LDLIBS   := -lssh
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic -pthread
+LDLIBS   := -lssh -pthread
 
 TARGET   := madbackuper
 SOURCES  := $(wildcard src/*.cpp) $(wildcard src/modules/*.cpp)
@@ -20,7 +20,7 @@ build/%.o: %.cpp
 clean:
 	rm -rf build $(TARGET)
 
-debug: CXXFLAGS := -std=c++17 -O1 -g3 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer
+debug: CXXFLAGS := -std=c++17 -O1 -g3 -Wall -Wextra -Wpedantic -pthread -fsanitize=address,undefined -fno-omit-frame-pointer
 debug: LDLIBS += -fsanitize=address,undefined
 debug: clean all
 
