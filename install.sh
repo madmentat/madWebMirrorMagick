@@ -18,13 +18,17 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+have_libssh_headers() {
+  [[ -f /usr/include/libssh/libssh.h || -f /usr/local/include/libssh/libssh.h ]]
+}
+
 install_deps_debian() {
   echo "📦 Устанавливаю зависимости сборки…"
   $SUDO apt-get update
   $SUDO apt-get install -y build-essential libssh-dev
 }
 
-if ! need_cmd g++ || ! need_cmd make || ! pkg-config --exists libssh 2>/dev/null; then
+if ! need_cmd g++ || ! need_cmd make || ! have_libssh_headers; then
   if need_cmd apt-get; then
     install_deps_debian
   else
