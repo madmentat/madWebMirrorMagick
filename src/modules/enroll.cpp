@@ -14,6 +14,9 @@
 namespace mad {
 namespace {
 
+constexpr const char* SERVICE_HOME = "/var/lib/madwebmirror";
+constexpr const char* SERVICE_KNOWN_HOSTS = "/var/lib/madwebmirror/.ssh/known_hosts";
+
 struct Endpoint {
     std::string user;
     std::string host;
@@ -112,11 +115,42 @@ std::string safe_id(std::string value) {
     return value.empty() ? "node" : value;
 }
 
+std::string ssh_host(const std::string& host) {
+    return host.find(':') == std::string::npos ? host : "[" + host + "]";
+}
+
+passwd* service_user() {
+    return ::getpwnam("madbackup");
+}
+
 void chown_to_service_user(const std::filesystem::path& path) {
     if (::geteuid() != 0) return;
-    passwd* pw = ::getpwnam("madbackup");
+    passwd* pw = service_user();
     if (!pw) return;
     ::chown(path.c_str(), pw->pw_uid, pw->pw_gid);
+}
+
+std::string service_command_prefix() {
+    // Enrollment initiated from sudo madUI should still write known_hosts as
+    // the long-running service account, not into /root/.ssh.
+    if (::geteuid() == 0 && service_user() && has_command("sudo")) {
+        return "sudo -u madbackup -H ";
+    }
+    return {};
+}
+
+bool ensure_trust_store(std::string& err) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(SERVICE_HOME) / ".ssh";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        err = "Не удалось создать SSH trust directory: " + ec.message();
+        return false;
+    }
+    ::chmod(dir.c_str(), 0700);
+    chown_to_service_user(dir);
+    return true;
 }
 
 bool ensure_key(const std::string& path, const std::string& label, std::string& err) {
@@ -167,7 +201,9 @@ bool ensure_key(const std::string& path, const std::string& label, std::string& 
 
 std::string proxy_command(const Endpoint& jump, const std::string& identity) {
     std::ostringstream cmd;
-    cmd << "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10";
+    cmd << "ssh -o BatchMode=yes -o StrictHostKeyChecking=yes"
+        << " -o UserKnownHostsFile=" << shell_quote(SERVICE_KNOWN_HOSTS)
+        << " -o ConnectTimeout=10";
     if (!identity.empty()) cmd << " -o IdentitiesOnly=yes -i " << shell_quote(identity);
     if (!jump.user.empty()) cmd << " -l " << shell_quote(jump.user);
     cmd << " -p " << jump.port << " -W %h:%p " << shell_quote(jump.host);
@@ -176,10 +212,15 @@ std::string proxy_command(const Endpoint& jump, const std::string& identity) {
 
 int copy_key_direct(const Endpoint& endpoint, const std::string& public_key) {
     std::ostringstream cmd;
-    cmd << "ssh-copy-id -i " << shell_quote(public_key)
-        << " -o StrictHostKeyChecking=ask -p " << endpoint.port << ' ';
-    if (!endpoint.user.empty()) cmd << shell_quote(endpoint.user + "@" + endpoint.host);
-    else cmd << shell_quote(endpoint.host);
+    cmd << service_command_prefix()
+        << "ssh-copy-id -i " << shell_quote(public_key)
+        << " -o StrictHostKeyChecking=ask"
+        << " -o UserKnownHostsFile=" << shell_quote(SERVICE_KNOWN_HOSTS)
+        << " -p " << endpoint.port << ' ';
+    const std::string target = endpoint.user.empty()
+        ? ssh_host(endpoint.host)
+        : endpoint.user + "@" + ssh_host(endpoint.host);
+    cmd << shell_quote(target);
     return run_local(cmd.str(), true);
 }
 
@@ -197,8 +238,10 @@ int copy_target_key(const Config& cfg, const std::string& jump_spec,
     }
 
     std::ostringstream cmd;
-    cmd << "ssh-copy-id -i " << shell_quote(cfg.ssh_identity_file + ".pub")
-        << " -o StrictHostKeyChecking=ask";
+    cmd << service_command_prefix()
+        << "ssh-copy-id -i " << shell_quote(cfg.ssh_identity_file + ".pub")
+        << " -o StrictHostKeyChecking=ask"
+        << " -o UserKnownHostsFile=" << shell_quote(SERVICE_KNOWN_HOSTS);
 
     if (!jump_spec.empty()) {
         Endpoint jump;
@@ -209,13 +252,16 @@ int copy_target_key(const Config& cfg, const std::string& jump_spec,
         cmd << " -o ProxyCommand=" << shell_quote(proxy_command(jump, jump_identity));
     }
 
-    cmd << " -p " << target.port << ' ' << shell_quote(target.user + "@" + target.host);
+    cmd << " -p " << target.port << ' '
+        << shell_quote(target.user + "@" + ssh_host(target.host));
     return run_local(cmd.str(), true);
 }
 
 } // namespace
 
 bool ensure_ssh_identities(Config& cfg, std::string& err) {
+    if (!ensure_trust_store(err)) return false;
+
     const std::string base = "/var/lib/madwebmirror/ssh";
     if (cfg.ssh_identity_file.empty()) {
         cfg.ssh_identity_file = base + "/target-" + safe_id(cfg.remote_host);
@@ -261,6 +307,7 @@ int enroll_ssh_interactive(Config& cfg, const std::string& config_path) {
 
     std::cout << "\n🔐 SSH enrollment\n"
               << "Пароли, если OpenSSH их запросит, вводятся прямо в этом терминале.\n"
+              << "Trust store: " << SERVICE_KNOWN_HOSTS << "\n"
               << "madWebMirrorMagick их не получает и не сохраняет.\n\n";
 
     if (!cfg.ssh_jump_primary.empty()) {
