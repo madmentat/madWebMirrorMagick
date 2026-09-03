@@ -11,10 +11,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Dependencies
-        run: sudo apt-get update && sudo apt-get install -y g++ make libssh-dev
+        run: sudo apt-get update && sudo apt-get install -y g++ make libssh-dev openssh-client sudo
       - name: Installer syntax
         run: bash -n install.sh
       - name: Build
         run: make -j2
       - name: CLI smoke test
-        run: ./madbackuper --help
+        run: |
+          ./madbackuper --help >/dev/null
+          printf '# empty first-run config\n' >/tmp/madwebmirror-ci.conf
+          printf '# empty tunnel policy\n' >/tmp/madwebmirror-tunnels-ci.conf
+          ./madbackuper tunnels --config=/tmp/madwebmirror-ci.conf --tunnels=/tmp/madwebmirror-tunnels-ci.conf
