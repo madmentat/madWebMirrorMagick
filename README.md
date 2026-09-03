@@ -1,74 +1,115 @@
 # madWebMirrorMagick
 
-`madbackuper` — C++17-утилита резервного копирования и аварийного переключения веб-сервера.
+`madWebMirrorMagick` — утилита для зеркалирования веб-сервера: резервное копирование файлов и БД, передача на резервный узел, health-check и failover.
 
-Она делает локальный архив сайта и `mysqldump`, передаёт их на резерв по SSH/SFTP, разворачивает резервную копию и поддерживает watchdog для nginx failover.
+Текущая ветка `develop` содержит новую модульную архитектуру и встроенную административную панель **madUI**.
 
-## Что изменено после рефакторинга
+## Быстрый старт
 
-Legacy unity-build удалён. Исходники разделены на нормальные модули:
-
-- `core` — конфигурация и общие функции;
-- `net` — SSH/SFTP;
-- `backup` — архивирование, дамп, передача и планировщик;
-- `deploy` — staging/rollback развёртывания;
-- `daemon` — health-check, failover и systemd installation.
-
-## Сборка
-
-Ubuntu/Debian:
+На Ubuntu/Debian-подобном сервере:
 
 ```bash
-sudo apt install g++ make libssh-dev
-make -j2
+./install.sh
 ```
 
-Отладочная сборка с ASan/UBSan:
+Если файл был получен без executable-bit:
+
+```bash
+bash install.sh
+```
+
+Установщик:
+
+1. проверяет sudo-сеанс;
+2. при необходимости устанавливает `build-essential` и `libssh-dev`;
+3. собирает проект;
+4. устанавливает бинарник как `/usr/local/bin/madwebmirror`;
+5. оставляет совместимый alias `/usr/local/bin/madbackuper`;
+6. сразу запускает **madUI**.
+
+После запуска терминал печатает один или несколько адресов вида:
+
+```text
+http://192.168.88.198:8790/
+```
+
+Откройте адрес в браузере. Вкладка получит одноразовый код, например:
+
+```text
+F7K2-W9Q4
+```
+
+В том же sudo-терминале появится запрос с IP и User-Agent браузера. Только после подтверждения `y` этой вкладке выдаётся временная `HttpOnly` session-cookie.
+
+**Пароль sudo/root сама программа не получает и не сохраняет.** Он используется только механизмом `sudo` для запуска административного процесса. После `Ctrl+C` madUI завершается, а все browser-session исчезают из памяти.
+
+### Ручной запуск madUI
+
+```bash
+sudo madwebmirror ui
+```
+
+По умолчанию madUI слушает IPv4 `0.0.0.0:8790`, потому что сервер обычно настраивается из браузера другой машины в локальной сети.
+
+Можно ограничить доступ loopback-интерфейсом:
+
+```bash
+sudo madwebmirror ui --ui-bind=127.0.0.1 --ui-port=8790
+```
+
+Для удалённого сервера этот вариант удобно использовать вместе с SSH tunnel.
+
+## Что уже умеет madUI
+
+- terminal trust handshake для новых браузеров;
+- отдельный on-demand административный режим — UI не обязан постоянно торчать наружу;
+- показывает текущую primary/mirror архитектуру;
+- редактирует ключевые параметры сайта, SSH, БД, backup schedule и health-check;
+- сохраняет конфигурацию атомарно с правами `0600`;
+- не показывает и не изменяет sudo/root password;
+- API закрыт до терминального подтверждения браузера;
+- SameSite session-cookie, same-origin проверка POST и базовые security headers.
+
+Интерфейс пока является первой рабочей оболочкой. Следующие логичные модули UI: обнаружение сервисов на узле, SSH enrollment удалённого узла, тест соединения, управление модулями, история backup/failover, лог событий и мастер установки systemd-компонентов.
+
+## CLI
+
+```text
+madbackuper backup
+madbackuper --daemon
+madbackuper monitor
+sudo madbackuper ui
+madbackuper install
+madbackuper uninstall
+```
+
+`madbackuper` сохранён как совместимое имя. Новое установленное имя — `madwebmirror`.
+
+## Сборка вручную
+
+```bash
+sudo apt-get install build-essential libssh-dev
+make
+```
+
+Debug-сборка:
 
 ```bash
 make debug
 ```
 
-## Первый запуск
+Она включает AddressSanitizer и UndefinedBehaviorSanitizer.
 
-```bash
-./madbackuper backup
-```
+## Безопасность
 
-Если конфигурации ещё нет, будет создан `~/.config/madbackuper.conf` с правами `0600`. При запуске из systemd обычно используется `/etc/madbackuper.conf`.
+SSH-соединение требует известный host key (`known_hosts`). Сначала используется SSH key, пароль допускается как fallback для совместимости.
 
-## SSH
+Обычная работа программы не должна зависеть от хранения root/sudo password. Привилегированные операции постепенно выносятся в отдельный минимальный helper/bootstrap-контур.
 
-Программа сначала пробует SSH-ключ и только затем пароль из конфига. Проверка host key обязательна: неизвестный или изменившийся ключ приводит к отказу подключения. Ключ сервера следует проверить и заранее добавить в `known_hosts` штатными средствами OpenSSH.
+Конфигурация хранится с правами `0600`. Старые поля `remote_pass`/`remote_sudo_pass` пока остаются ради совместимости со старой конфигурацией, но madUI намеренно не выставляет sudo password как постоянную настройку.
 
-## Права
+## Ветки
 
-Обычный backup/deploy больше не создаёт `sudoers`, не монтирует файловые системы и не редактирует `/etc/fstab`.
-
-Удалённый пользователь должен заранее иметь права на:
-
-- `remote_backup_base`;
-- `remote_site_dir` и его родительский каталог (для staging/rollback);
-- указанную БД через `db_user`.
-
-База и её пользователь создаются один раз администратором. Программа больше не выполняет `CREATE USER`/`GRANT ALL` от MySQL root при каждом deploy.
-
-Для ручного failover от непривилегированного SSH-пользователя нужен только узкий sudo-доступ к root-owned switch script, например двум конкретным командам `... local` и `... remote`. Универсальные `sudo tee`, `mv`, `mount`, `tar` и подобные права не нужны.
-
-## Режимы
-
-```bash
-./madbackuper backup
-./madbackuper --daemon
-./madbackuper monitor
-./madbackuper install
-./madbackuper uninstall
-```
-
-`--daemon` сохранён для совместимости и снова означает ежедневный backup по `schedule_hhmm`. Команда `install` ставит отдельный systemd timer для backup и watchdog на резервной машине.
-
-## Надёжность deploy
-
-Сайт сначала распаковывается в staging-каталог. Старый webroot сохраняется как `.old`; при ошибке импорта БД webroot откатывается. Ошибка удалённого deploy теперь возвращается вызывающему процессу как ненулевой exit code.
-
-Архивы, SQL и временные DB credentials создаются с закрытыми правами; DB credentials удаляются после deploy.
+- `snapshot` — зафиксированное состояние старой рабочей версии до рефакторинга;
+- `release` — прежняя release-версия;
+- `develop` — текущая разработка, включая madUI.
