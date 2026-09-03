@@ -65,6 +65,7 @@ int run_local(const std::string& cmd, bool echo = true);
 std::string shell_quote(const std::string& value);
 
 void write_default_config(const std::string& path);
+void save_config(const std::string& path, const Config& cfg);
 void load_kv_file(const std::string& path, Config& cfg);
 void apply_cli_kv(int argc, char** argv, Config& cfg);
 bool validate(const Config& cfg, std::string& err);
