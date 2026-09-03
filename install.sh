@@ -30,11 +30,11 @@ install_deps_debian() {
   $SUDO apt-get install -y build-essential libssh-dev openssh-client sudo
 }
 
-if ! need_cmd g++ || ! need_cmd make || ! need_cmd ssh || ! have_libssh_headers; then
+if ! need_cmd g++ || ! need_cmd make || ! need_cmd ssh || ! need_cmd ssh-keygen || ! need_cmd ssh-copy-id || ! have_libssh_headers; then
   if need_cmd apt-get; then
     install_deps_debian
   else
-    echo "❌ Нужны g++, make, ssh (OpenSSH client), sudo и libssh development headers. Автоустановка пока реализована для apt-based систем." >&2
+    echo "❌ Нужны g++, make, OpenSSH client, sudo и libssh development headers. Автоустановка пока реализована для apt-based систем." >&2
     exit 1
   fi
 fi
@@ -60,6 +60,18 @@ echo "📁 Готовлю системные каталоги…"
 $SUDO install -d -m 0755 "$PREFIX/bin" "$PREFIX/libexec"
 $SUDO install -d -m 0750 -o root -g "$SERVICE_GROUP_NAME" /etc/madwebmirror /srv/madwebmirror /srv/madwebmirror/sites
 $SUDO install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP_NAME" /var/lib/madwebmirror /var/lib/madwebmirror/sites
+$SUDO install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP_NAME" /var/lib/madwebmirror/ssh
+
+if [[ ! -e /etc/madwebmirror/tunnels.conf ]]; then
+  TUNNELS_TMP="$(mktemp)"
+  cat >"$TUNNELS_TMP" <<'EOF'
+# madWebMirrorMagick SSH tunnel manager
+# id|route(primary/fallback)|direction(local/remote)|bind_host|bind_port|target_host|target_port|enabled
+# Same id on primary and fallback creates one automatic failover group.
+EOF
+  $SUDO install -o "$SERVICE_USER" -g "$SERVICE_GROUP_NAME" -m 0640 "$TUNNELS_TMP" /etc/madwebmirror/tunnels.conf
+  rm -f "$TUNNELS_TMP"
+fi
 
 echo "📥 Устанавливаю основной бинарник и privileged helper…"
 $SUDO install -m 0755 ./madbackuper "$BIN_DST"
@@ -84,6 +96,8 @@ echo "   • $SERVICE_USER не имеет shell-login;"
 echo "   • sudo/root пароль программе не нужен;"
 echo "   • privileged операции доступны только через $HELPER_DST;"
 echo "   • web-копии создаются под /srv/madwebmirror/sites/<site-id>;"
+echo "   • SSH keys хранятся в /var/lib/madwebmirror/ssh с правами service account;"
+echo "   • tunnel policy хранится в /etc/madwebmirror/tunnels.conf;"
 echo "   • OpenSSH client доступен для jump/bastion transport через Proxy A/Proxy B."
 echo
 echo "✨ Сейчас будет запущен madUI."
