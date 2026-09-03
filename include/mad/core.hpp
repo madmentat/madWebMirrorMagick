@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <chrono>
+#include <vector>
 
 namespace mad {
 namespace fs = std::filesystem;
@@ -11,6 +12,42 @@ using clock_ = std::chrono::steady_clock;
 
 
 struct Config; // реализация в core.cpp
+
+// ───────── Сущности новой архитектуры (multi-site / multi-mirror / proxy) ─────────
+struct Site {
+    std::string name;                 // "site1"
+    std::string server_name;          // домен
+    std::string local_site_dir;
+    std::string db_user, db_pass, db_name;
+    std::vector<std::string> mirrors; // имена зеркал в порядке приоритета
+};
+
+struct Mirror {
+    std::string name;                 // "mirror1"
+    std::string remote_host;
+    int ssh_port = 22;
+    std::string remote_user, remote_pass, remote_sudo_pass, remote_root_pass;
+    std::string target_server;        // "nginx" | "apache2"
+    std::string remote_site_dir;
+    std::string remote_backup_base;
+    int local_http_port = 8081;
+    int local_https_port = 0;
+    std::string php_version, php_fpm_sock;
+    std::string ssl_cert, ssl_key;
+    std::string health_url;           // как proxy/демон видят копию на этом зеркале
+    int fail_threshold = 3;           // N подряд неудач → DOWN
+    int ok_threshold = 3;             // N подряд успехов → UP
+};
+
+struct Proxy {
+    std::string host;
+    int ssh_port = 22;
+    std::string user, pass, sudo_pass;
+    std::string server_type;          // "nginx" | "apache2"
+    std::string health_url;           // как демон видит proxy
+    int fail_threshold = 3;
+    int ok_threshold = 3;
+};
 
 
 // utils
@@ -84,6 +121,14 @@ struct Config {
     // демонизация/расписание
     int         health_interval_sec = 60;    // период health-check, сек
     std::string schedule_hhmm = "04:00";     // время ежедневного запуска
+
+    // ── новая архитектура (multi-site / multi-mirror / proxy) ──
+    std::string main_health_url;      // main как его видят proxy/зеркала извне (NAT!)
+    std::vector<Site> sites;
+    std::vector<Mirror> mirrors;
+    Proxy proxy;
+    bool has_proxy = false;
+    bool section_format = false;      // конфиг в секционном формате ([site:...]/[mirror:...])
 };
 
 void write_default_config(const std::string& path);

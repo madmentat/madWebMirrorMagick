@@ -6,6 +6,9 @@
 #include <sstream>
 #include <fstream>
 #include <vector>
+#include <map>
+#include <utility>
+#include <ctime>
 
 #include <unistd.h>     // readlink
 #include <limits.h>
@@ -21,35 +24,40 @@ namespace mad {
 // Короткий алиас на shell-эскейп одинарными кавычками
 static inline std::string esc_s(const std::string& s) { return sh_escape_single(s); }
 
-// ─────────────────────────── Health-check локального фронта ──────────────────
-bool check_local_site_ok(const Config& cfg) {
-    const std::string url = cfg.health_url.empty()
-        ? ("http://127.0.0.1:" + std::to_string(cfg.local_http_port) + "/")
-        : cfg.health_url;
-
+// ─────────────────────────── Универсальный health-check ──────────────────────
+// curl -fsSL -m 5 [ -H "Host: <host_header>" ] <url>
+bool check_url(const std::string& url, const std::string& host_header) {
     std::ostringstream cmd;
     cmd << "curl -fsSL -m 5 ";
-    if (!cfg.health_host_header.empty())
-        cmd << "-H 'Host: " << cfg.health_host_header << "' ";
+    if (!host_header.empty())
+        cmd << "-H 'Host: " << host_header << "' ";
     cmd << esc_s(url) << " >/dev/null 2>&1";
     return std::system(cmd.str().c_str()) == 0;
 }
 
+// URL для проверки main: cfg.health_url или fallback на локальный порт
+static std::string main_health_url(const Config& cfg) {
+    return cfg.health_url.empty()
+        ? ("http://127.0.0.1:" + std::to_string(cfg.local_http_port) + "/")
+        : cfg.health_url;
+}
+
 // ─────────────────────────── Одноразовый удалённый exec ──────────────────────
-static int ssh_exec_one(const Config& cfg, const std::string& command, bool print_out = true) {
+static int ssh_exec_one_host(const std::string& host, int port, const std::string& user,
+                             const std::string& pass, const std::string& command, bool print_out = true) {
     ssh_session s = ssh_new();
     if (!s) { std::cerr << "❌ ssh_new()\n"; return -1; }
 
-    ssh_options_set(s, SSH_OPTIONS_HOST, cfg.remote_host.c_str());
-    ssh_options_set(s, SSH_OPTIONS_USER, cfg.remote_user.c_str());
-    ssh_options_set(s, SSH_OPTIONS_PORT, &cfg.ssh_port);
+    ssh_options_set(s, SSH_OPTIONS_HOST, host.c_str());
+    ssh_options_set(s, SSH_OPTIONS_USER, user.c_str());
+    ssh_options_set(s, SSH_OPTIONS_PORT, &port);
 
     if (ssh_connect(s) != SSH_OK) {
         std::cerr << "❌ ssh_connect: " << ssh_get_error(s) << "\n";
         ssh_free(s);
         return -1;
     }
-    if (ssh_userauth_password(s, nullptr, cfg.remote_pass.c_str()) != SSH_AUTH_SUCCESS) {
+    if (ssh_userauth_password(s, nullptr, pass.c_str()) != SSH_AUTH_SUCCESS) {
         std::cerr << "❌ ssh auth failed: " << ssh_get_error(s) << "\n";
         ssh_disconnect(s);
         ssh_free(s);
@@ -62,61 +70,148 @@ static int ssh_exec_one(const Config& cfg, const std::string& command, bool prin
     return rc;
 }
 
-// ─────────────────────── Переключение nginx на 202 (remote) ──────────────────
-int remote_switch_to_local_nginx(const Config& cfg) {
-    std::ostringstream cmd;
-    cmd << "sh -lc '"
-        << "F=/root/setup_" << esc_s(cfg.server_name) << "_nginx.sh; "
-        << "if [ -x \"$F\" ]; then \"$F\" local; else echo \"(no setup script)\" >&2; fi"
-        << "'";
-    return ssh_exec_one(cfg, cmd.str(), /*print_out=*/true);
+// ─────────────────────────── Поиск зеркала по имени ──────────────────────────
+static const Mirror* find_mirror(const Config& cfg, const std::string& name) {
+    for (const auto& m : cfg.mirrors)
+        if (m.name == name) return &m;
+    return nullptr;
 }
 
-int remote_switch_to_remote_nginx(const Config& cfg) {
-    std::ostringstream cmd;
-    cmd << "sh -lc '"
-        << "F=/root/setup_" << esc_s(cfg.server_name) << "_nginx.sh; "
-        << "if [ -x \"$F\" ]; then \"$F\" remote; else echo \"(no setup script)\" >&2; fi"
-        << "'";
-    return ssh_exec_one(cfg, cmd.str(), /*print_out=*/true);
+// ─────────────────────────── Супервизия оркестратора ─────────────────────────
+static void supervise_orchestrator(const Config& cfg) {
+    // systemctl is-active: 0 = active, иначе неактивен/ошибка
+    const int rc = ssh_exec_one_host(cfg.proxy.host, cfg.proxy.ssh_port, cfg.proxy.user,
+                                     cfg.proxy.pass, "systemctl is-active madbackuper-proxy",
+                                     /*print_out=*/false);
+    if (rc == 0) return; // оркестратор жив
+
+    std::cout << "⚠️  Оркестратор на " << cfg.proxy.host << " не активен — перезапускаю\n";
+    const int rrc = ssh_exec_one_host(cfg.proxy.host, cfg.proxy.ssh_port, cfg.proxy.user,
+                                      cfg.proxy.pass, "systemctl restart madbackuper-proxy",
+                                      /*print_out=*/true);
+    if (rrc == 0) std::cout << "🔄 Оркестратор перезапущен\n";
+    else          std::cerr << "❌ Не удалось перезапустить оркестратор на " << cfg.proxy.host << "\n";
 }
 
-int ensure_watchdog_units(const Config& /*cfg*/) {
-    // TODO: позже можно добавить периодическую верификацию юнитов
-    return 0;
+// ─────────────────────────── Плановые бэкапы по расписанию ───────────────────
+static std::string now_hhmm() {
+    std::time_t t = std::time(nullptr);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    char buf[6];
+    std::strftime(buf, sizeof(buf), "%H:%M", &tm);
+    return std::string(buf);
 }
 
-// ───────────────────────────── Демон-цикл на 198 ─────────────────────────────
-int run_daemon_loop(const Config& cfg) {
-    std::cout << "🌀 Демон запущен: health-check и переключение фронта (nginx)\n";
+static void run_scheduled_backups(const Config& cfg, std::string& last_backup_date) {
+    const std::string today_str = today();
+    if (last_backup_date == today_str) return;   // сегодня уже запускали
+    if (now_hhmm() < cfg.schedule_hhmm) return;  // ещё не наступило время
 
-    bool in_local_mode = false;
-    const int health_interval_sec = cfg.health_interval_sec > 0 ? cfg.health_interval_sec : 60;
-
-    // Первый прогон
-    {
-        const bool ok = check_local_site_ok(cfg);
-        if (!ok && cfg.target_server == "nginx") {
-            std::cout << "⚠️  Локальный сайт не отвечает — переключаю фронт на local (202)\n";
-            if (remote_switch_to_local_nginx(cfg) == 0) in_local_mode = true;
+    last_backup_date = today_str;
+    for (const auto& s : cfg.sites) {
+        for (const auto& mn : s.mirrors) {
+            if (!find_mirror(cfg, mn)) continue;
+            const std::string cmd = "/usr/local/bin/madbackuper --site=" + s.name + " --mirror=" + mn;
+            std::cout << "🗓 Плановый бэкап: " << cmd << "\n";
+            const int rc = std::system(cmd.c_str());
+            std::cout << (rc == 0 ? "✅ Бэкап OK: " : "❌ Бэкап завершился с кодом " + std::to_string(rc) + ": ")
+                      << s.name << "/" << mn << "\n";
         }
     }
+}
+
+// ───────────────────────────── Демон-цикл (монитор) ──────────────────────────
+int run_daemon_loop(const Config& cfg) {
+    std::cout << "🌀 Демон-монитор запущен: health-check main/зеркал/proxy + плановые бэкапы\n";
+
+    const int interval = cfg.health_interval_sec > 0 ? cfg.health_interval_sec : 60;
+
+    // Состояние в памяти: последнее известное состояние каждого проверяемого узла
+    bool main_known = false, main_last_ok = false;
+    std::map<std::pair<std::string, std::string>, bool> mirror_last_ok;
+    bool proxy_known = false, proxy_last_ok = false;
+    std::string last_backup_date; // дата последнего запуска планового бэкапа
 
     while (true) {
-        const bool ok = check_local_site_ok(cfg);
-
-        if (!ok && !in_local_mode && cfg.target_server == "nginx") {
-            std::cout << "⚠️  Локальный сайт упал — переключаю фронт на local (202)\n";
-            if (remote_switch_to_local_nginx(cfg) == 0) in_local_mode = true;
-        } else if (ok && in_local_mode && cfg.target_server == "nginx") {
-            std::cout << "✅ Локальный сайт ожил — возвращаю фронт на remote (202)\n";
-            if (remote_switch_to_remote_nginx(cfg) == 0) in_local_mode = false;
+        // 1) main
+        {
+            const bool ok = check_url(main_health_url(cfg), cfg.health_host_header);
+            if (!main_known || ok != main_last_ok) {
+                std::cout << (ok ? "🟢 main: OK" : "🔴 main: НЕДОСТУПЕН") << "\n";
+                main_last_ok = ok;
+                main_known = true;
+            }
         }
 
-        std::this_thread::sleep_for(std::chrono::seconds(health_interval_sec));
+        // 2) зеркала (по сайтам)
+        for (const auto& s : cfg.sites) {
+            for (const auto& mn : s.mirrors) {
+                const Mirror* m = find_mirror(cfg, mn);
+                if (!m) continue;
+                const bool ok = check_url(m->health_url, s.server_name);
+                const auto key = std::make_pair(s.name, mn);
+                const auto it = mirror_last_ok.find(key);
+                if (it == mirror_last_ok.end() || it->second != ok) {
+                    std::cout << (ok ? "🟢" : "🔴") << " Сайт " << s.name << " / зеркало " << mn
+                              << ": " << (ok ? "OK" : "НЕДОСТУПЕН") << "\n";
+                    mirror_last_ok[key] = ok;
+                }
+            }
+        }
+
+        // 3) proxy + супервизия оркестратора
+        if (cfg.has_proxy) {
+            const bool ok = check_url(cfg.proxy.health_url, "");
+            if (!proxy_known || ok != proxy_last_ok) {
+                std::cout << (ok ? "🟢 proxy: OK" : "🔴 proxy: НЕДОСТУПЕН") << "\n";
+                proxy_last_ok = ok;
+                proxy_known = true;
+            }
+            supervise_orchestrator(cfg);
+        }
+
+        // 4) плановый бэкап (запуск самого себя в однократном режиме)
+        run_scheduled_backups(cfg, last_backup_date);
+
+        std::this_thread::sleep_for(std::chrono::seconds(interval));
     }
     // недостижимо
     // return 0;
+}
+
+// ─────────────────────────── Однократный отчёт (--status) ────────────────────
+int status_report(const Config& cfg) {
+    std::cout << "📊 Статус:\n";
+
+    // main
+    {
+        const bool ok = check_url(main_health_url(cfg), cfg.health_host_header);
+        std::cout << "main:            " << (ok ? "🟢 OK" : "🔴 НЕДОСТУПЕН") << "\n";
+    }
+
+    // зеркала (по сайтам)
+    for (const auto& s : cfg.sites) {
+        for (const auto& mn : s.mirrors) {
+            const Mirror* m = find_mirror(cfg, mn);
+            if (!m) {
+                std::cout << s.name << "/" << mn << ":   ⚠️ зеркало не найдено в конфиге\n";
+                continue;
+            }
+            const bool ok = check_url(m->health_url, s.server_name);
+            std::cout << s.name << "/" << mn << ":   "
+                      << (ok ? "🟢 OK" : "🔴 НЕДОСТУПЕН")
+                      << " (" << m->remote_host << ":" << m->local_http_port << ")\n";
+        }
+    }
+
+    // proxy
+    if (cfg.has_proxy) {
+        const bool ok = check_url(cfg.proxy.health_url, "");
+        std::cout << "proxy:           " << (ok ? "🟢 OK" : "🔴 НЕДОСТУПЕН") << "\n";
+    }
+
+    return 0;
 }
 
 // ────────────────────────── Вспомогалки для инсталляции ──────────────────────
@@ -138,7 +233,7 @@ static inline int run_local_cmd(const std::string& cmd) {
     return ::mad::run_local(cmd, true);
 }
 
-// ───────────────────────── Локальный systemd-юнит (198) ──────────────────────
+// ───────────────────────── Локальный systemd-юнит (main) ─────────────────────
 static int install_local_service(const std::string& exe_path) {
     run_local_cmd("install -m 0755 " + esc_s(exe_path) + " /usr/local/bin/madbackuper");
 
@@ -179,163 +274,25 @@ static int uninstall_local_service() {
     return 0;
 }
 
-// ───────────── Удалённый watchdog (скрипт + unit) на 202 (remote_host) ───────
-static int install_remote_watchdog(const Config& cfg)
-{
-    // --- 1) Bash-скрипт watchdog (как делали вручную)
-    std::ostringstream script;
-    script
-    << "#!/usr/bin/env bash\n"
-    << "set -Eeuo pipefail\n"
-    << "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
-    << "SERVER_NAME=" << esc_s(cfg.server_name) << "\n"
-    << "PROXY_TARGET=" << esc_s(cfg.proxy_target) << "\n"
-    << "HTTP_PORT=" << (cfg.local_http_port > 0 ? cfg.local_http_port : 80) << "\n"
-    << "INTERVAL=" << (cfg.health_interval_sec > 0 ? cfg.health_interval_sec : 60) << "\n"
-    << "SETUP=\"/root/setup_${SERVER_NAME}_nginx.sh\"\n"
-    << "log(){ echo \"[watchdog] $*\"; }\n"
-    << "last_state=\"unknown\"\n"
-    << "while true; do\n"
-    << "  if curl -fsS -m 5 \"http://${PROXY_TARGET}:${HTTP_PORT}/\" >/dev/null 2>&1; then\n"
-    << "    state=\"up\"\n"
-    << "  else\n"
-    << "    state=\"down\"\n"
-    << "  fi\n"
-    << "  if [[ \"$state\" != \"$last_state\" ]]; then\n"
-    << "    if [[ \"$state\" == \"up\" ]]; then\n"
-    << "      log \"198 ↑ — переключаю 202 в remote\"\n"
-    << "      [[ -x \"$SETUP\" ]] && \"$SETUP\" remote || log \"нет $SETUP\"\n"
-    << "    else\n"
-    << "      log \"198 ↓ — переключаю 202 в local\"\n"
-    << "      [[ -x \"$SETUP\" ]] && \"$SETUP\" local  || log \"нет $SETUP\"\n"
-    << "    fi\n"
-    << "    last_state=\"$state\"\n"
-    << "  fi\n"
-    << "  sleep \"$INTERVAL\"\n"
-    << "done\n";
-
-    // --- 2) SSH + SFTP: кладём оба файла в /tmp на 202
-    ssh_session s = ssh_new();
-    if (!s) return -1;
-    ssh_options_set(s, SSH_OPTIONS_HOST, cfg.remote_host.c_str());
-    ssh_options_set(s, SSH_OPTIONS_USER, cfg.remote_user.c_str());
-    ssh_options_set(s, SSH_OPTIONS_PORT, &cfg.ssh_port);
-    if (ssh_connect(s) != SSH_OK) { ssh_free(s); return -1; }
-    if (ssh_userauth_password(s, nullptr, cfg.remote_pass.c_str()) != SSH_AUTH_SUCCESS) {
-        ssh_disconnect(s); ssh_free(s); return -1;
-    }
-
-    sftp_session sf = sftp_new(s);
-    if (!sf || sftp_init(sf) != SSH_OK) { if (sf) sftp_free(sf); ssh_disconnect(s); ssh_free(s); return -1; }
-
-    const std::string local_script = "/tmp/mad_watchdog_198.sh";
-    { std::ofstream f(local_script); f << script.str(); }
-
-    int sftp_err = 0;
-    if (sftp_upload_file_progress(s, sf, local_script, "/tmp/mad_watchdog_198.sh", "watchdog", &sftp_err, 0644) != 0) {
-        std::cerr << "❌ Не удалось загрузить watchdog на " << cfg.remote_host << " (SFTP)\n";
-        sftp_free(sf); ssh_disconnect(s); ssh_free(s); return -1;
-    }
-    sftp_free(sf);
-
-    // --- 3) Сборка unit-файла локально → /tmp на 202
-    std::ostringstream unit;
-    unit <<
-R"([Unit]
-Description=madbackuper remote watchdog (switch local/remote on 202)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/env bash /usr/local/bin/mad_watchdog_198.sh
-Restart=always
-RestartSec=5
-User=root
-StandardOutput=journal
-StandardError=journal
-Environment=LANG=C.UTF-8
-
-[Install]
-WantedBy=multi-user.target
-)";
-    const std::string local_unit = "/tmp/madbackuper-watchdog.service";
-    { std::ofstream u(local_unit); u << unit.str(); }
-
-    sftp_session sf2 = sftp_new(s);
-    if (!sf2 || sftp_init(sf2) != SSH_OK) { if (sf2) sftp_free(sf2); ssh_disconnect(s); ssh_free(s); return -1; }
-    if (sftp_upload_file_progress(s, sf2, local_unit, "/tmp/madbackuper-watchdog.service", "watchdog-unit", &sftp_err, 0644) != 0) {
-        std::cerr << "❌ Не удалось загрузить unit-файл на " << cfg.remote_host << "\n";
-        sftp_free(sf2); ssh_disconnect(s); ssh_free(s); return -1;
-    }
-    sftp_free(sf2);
-
-    // --- 4) Повышенные права: КАЖДУЮ команду подаём как `printf %s PW | sudo -S ...`
-    const std::string pw = cfg.remote_sudo_pass.empty() ? cfg.remote_pass : cfg.remote_sudo_pass;
-    const std::string PW = esc_s(pw);
-
-    // скрипт → /usr/local/bin, права 0755, удалить временный
-    {
-        std::ostringstream cmd;
-        cmd << "sh -lc 'set -e; "
-            << "printf %s " << PW << " | sudo -S -p \"\" mkdir -p /usr/local/bin; "
-            << "printf %s " << PW << " | sudo -S -p \"\" install -m 0755 /tmp/mad_watchdog_198.sh /usr/local/bin/mad_watchdog_198.sh; "
-            << "printf %s " << PW << " | sudo -S -p \"\" rm -f /tmp/mad_watchdog_198.sh"
-            << "'";
-        if (ssh_exec(s, cmd.str(), /*print_out=*/true) != 0) {
-            std::cerr << "❌ Не удалось установить /usr/local/bin/mad_watchdog_198.sh на " << cfg.remote_host << "\n";
-            ssh_disconnect(s); ssh_free(s); return -1;
-        }
-    }
-
-    // unit → /etc/systemd/system + enable/restart
-    {
-        std::ostringstream cmd;
-        cmd << "sh -lc 'set -e; "
-            << "printf %s " << PW << " | sudo -S -p \"\" mv /tmp/madbackuper-watchdog.service /etc/systemd/system/madbackuper-watchdog.service; "
-            << "printf %s " << PW << " | sudo -S -p \"\" systemctl daemon-reload; "
-            << "printf %s " << PW << " | sudo -S -p \"\" systemctl enable madbackuper-watchdog.service; "
-            << "printf %s " << PW << " | sudo -S -p \"\" systemctl restart madbackuper-watchdog.service"
-            << "'";
-        if (ssh_exec(s, cmd.str(), /*print_out=*/true) != 0) {
-            std::cerr << "❌ Не удалось зарегистрировать/запустить watchdog unit на " << cfg.remote_host << "\n";
-            ssh_disconnect(s); ssh_free(s); return -1;
-        }
-    }
-
-    ssh_disconnect(s);
-    ssh_free(s);
-    return 0;
-}
-
-static int uninstall_remote_watchdog(const Config& cfg)
-{
-    const std::string pw = cfg.remote_sudo_pass.empty() ? cfg.remote_pass : cfg.remote_sudo_pass;
-    const std::string PW = esc_s(pw);
-
-    std::ostringstream sh;
-    sh << "sh -lc 'set -e; "
-       << "printf %s " << PW << " | sudo -S -p \"\" systemctl stop madbackuper-watchdog.service >/dev/null 2>&1 || true; "
-       << "printf %s " << PW << " | sudo -S -p \"\" systemctl disable madbackuper-watchdog.service >/dev/null 2>&1 || true; "
-       << "printf %s " << PW << " | sudo -S -p \"\" rm -f /etc/systemd/system/madbackuper-watchdog.service; "
-       << "printf %s " << PW << " | sudo -S -p \"\" rm -f /usr/local/bin/mad_watchdog_198.sh; "
-       << "printf %s " << PW << " | sudo -S -p \"\" systemctl daemon-reload"
-       << "'";
-
-    return ssh_exec_one(cfg, sh.str(), /*print_out=*/true);
-}
-
 // ───────────────────────── Публичные API установки демона ────────────────────
 int daemon_install(const Config& cfg, const std::string& self_path)
 {
     std::string exe = self_path.empty() ? readlink_self() : self_path;
     if (exe.empty()) { std::cerr << "❌ Не удалось определить путь к бинарю\n"; return 1; }
 
-    int rc_local  = install_local_service(exe);
-    int rc_remote = install_remote_watchdog(cfg);
+    int rc_local = install_local_service(exe);
+    if (rc_local != 0) std::cerr << "⚠️  Проблема при установке локального юнита\n";
 
-    if (rc_local != 0)  std::cerr << "⚠️  Проблема при установке локального юнита\n";
-    if (rc_remote != 0) std::cerr << "⚠️  Проблема при установке удалённого watchdog'а на " << cfg.remote_host << "\n";
+    if (cfg.has_proxy) {
+        std::cout << "🛰 Устанавливаю оркестратор на proxy " << cfg.proxy.host << "\n";
+        if (proxy_install) {
+            const int rc_proxy = proxy_install(cfg);
+            if (rc_proxy != 0) std::cerr << "⚠️  Проблема при установке оркестратора на " << cfg.proxy.host << "\n";
+            else               std::cout << "✅ Оркестратор установлен на " << cfg.proxy.host << "\n";
+        } else {
+            std::cerr << "⚠️  Модуль оркестратора (proxy.cpp) не собран — пропускаю установку на " << cfg.proxy.host << "\n";
+        }
+    }
 
     std::cout << "✅ Установка демона завершена. Логи: journalctl -u madbackuper -f\n";
     return 0; // завершаем текущий процесс — дальше рулит systemd
@@ -343,10 +300,17 @@ int daemon_install(const Config& cfg, const std::string& self_path)
 
 int daemon_uninstall(const Config& cfg)
 {
-    int rc_remote = uninstall_remote_watchdog(cfg);
-    int rc_local  = uninstall_local_service();
+    int rc_local = uninstall_local_service();
 
-    if (rc_remote != 0) std::cerr << "⚠️  Не удалось корректно убрать watchdog на " << cfg.remote_host << "\n";
+    if (cfg.has_proxy) {
+        if (proxy_uninstall) {
+            const int rc_proxy = proxy_uninstall(cfg);
+            if (rc_proxy != 0) std::cerr << "⚠️  Не удалось корректно убрать оркестратор на " << cfg.proxy.host << "\n";
+        } else {
+            std::cerr << "⚠️  Модуль оркестратора (proxy.cpp) не собран — пропускаю удаление на " << cfg.proxy.host << "\n";
+        }
+    }
+
     std::cout << "✅ Демон отключён локально. Для проверки: systemctl status madbackuper\n";
     return rc_local == 0 ? 0 : rc_local;
 }

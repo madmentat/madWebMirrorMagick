@@ -87,6 +87,11 @@ std::string build_nginx_deploy_cmd(const Config& C,
        "WHERE table_schema=\\\"" << dq(C.db_name) << "\\\";'\" 2>/dev/null || echo 0); "
     << "echo '   📊 Таблиц в БД после импорта: '\"$CNT\" 1>&2; "
 
+    // ротация старых бэкапов (по образцу apache)
+    << "echo '🧹 Ротация старых бэкапов (7+ дней)' 1>&2; "
+    << "find \"" << dq(C.remote_backup_base) << "\" -maxdepth 1 -type d "
+       "-regextype posix-extended -regex '.*/[0-9]{4}-[0-9]{2}-[0-9]{2}$' -mtime +7 -exec rm -rf {} + ; "
+
     << "exit 0;";
 
     return sh.str();

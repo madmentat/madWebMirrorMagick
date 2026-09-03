@@ -2,7 +2,7 @@
 // ------------------------------------------------------------
 // Бэкап и развёртывание на резервный хост (Ubuntu/Debian).
 // Новое:
-//   • --daemon + --at=HH:MM (по умолчанию 03:00)
+//   • Мультисайтовая архитектура: секции [site:...], [mirror:...] (см. include/mad/core.hpp)
 //   • --skip-tar / --skip-sql / --skip-upload
 //   • Проверка наличия nginx без зависимости от PATH
 //   • Привилегированные действия через sudo (учёт отдельного remote_sudo_pass)
@@ -10,14 +10,16 @@
 //   • БД (MariaDB/MySQL): лог импорта и число таблиц после заливки
 //   • Прогресс архивации/передачи, проверка места, bind-mount /webserver
 //   • Автосоздание sudoers и нужных каталогов
-//   • Автогенерация /root/setup_madmentat_nginx.sh и работа с /webserver/wachdog
+//   • Прямая генерация локального backend-конфига nginx
+//     (/etc/nginx/sites-available/<server>.local.conf, listen <local_http_port>)
+//     — публичный фронт живёт на отдельном proxy
 //
 // Сборка:
 //   g++ -std=c++17 madbackuper.cpp -o madbackuper -lssh
 //
 // Примеры:
-//   ./madbackuper --target-server=nginx --skip-upload
-//   ./madbackuper --daemon --at=03:00 --target-server=nginx --php-version=8.3
+//   ./madbackuper --skip-upload
+//   ./madbackuper --site=site1 --mirror=mirror2
 // ------------------------------------------------------------
 #include <libssh/libssh.h>
 #include <libssh/sftp.h>
@@ -51,25 +53,6 @@ using clock_ = std::chrono::steady_clock;
 static std::atomic<bool> g_stop{false};
 static void on_sigint (int){ g_stop = true; }
 static void on_sigterm(int){ g_stop = true; }
-
-// --------------------------- Время/сон ---------------------------
-static std::time_t next_local_time(int hh, int mm) {
-    std::time_t now = std::time(nullptr);
-    std::tm lt{};
-    localtime_r(&now, &lt);
-    lt.tm_hour = hh; lt.tm_min = mm; lt.tm_sec = 0;
-    std::time_t t = std::mktime(&lt);
-    if (t <= now) { lt.tm_mday += 1; t = std::mktime(&lt); }
-    return t;
-}
-static void sleep_until_epoch(std::time_t target) {
-    while (!g_stop) {
-        std::time_t now = std::time(nullptr);
-        if (now >= target) break;
-        auto remain = target - now;
-        std::this_thread::sleep_for(std::chrono::seconds(remain > 60 ? 60 : remain));
-    }
-}
 
 // --- ⬇ перенесено в модули: // --------------------------- Константы ---------------------------
 #if 0
@@ -138,8 +121,8 @@ static std::string sh_escape_single(const std::string& s) {
     for (char c: s) { if (c=='\'') out += "'\\''"; else out += c; }
     return out;
 }
-static std::string sudo_prefix(ssh_session session, const Config& C) {
-    if (C.remote_user == "root") return "";
+static std::string sudo_prefix(ssh_session session, const Mirror& M) {
+    if (M.remote_user == "root") return "";
     // 1) пробуем без пароля
     {
         ssh_channel ch = ssh_channel_new(session);
@@ -152,7 +135,7 @@ static std::string sudo_prefix(ssh_session session, const Config& C) {
         } else if (ch) { ssh_channel_close(ch); ssh_channel_free(ch); }
     }
     // 2) через stdin
-    std::string sudopw = C.remote_sudo_pass.empty() ? C.remote_pass : C.remote_sudo_pass;
+    std::string sudopw = M.remote_sudo_pass.empty() ? M.remote_pass : M.remote_sudo_pass;
     return "echo '" + sh_escape_single(sudopw) + "' | sudo -S -p ''";
 }
 
@@ -164,11 +147,11 @@ static uint64_t remote_bytes_avail(ssh_session session, const std::string& path)
     if (rc != 0 || out.empty()) return 0;
     try { return std::stoull(trim(out)); } catch (...) { return 0; }
 }
-static int ensure_space_and_bind_mount(ssh_session session, const Config& C, uint64_t need_bytes) {
+static int ensure_space_and_bind_mount(ssh_session session, const Mirror& M, uint64_t need_bytes) {
     std::cout << "💽 Проверка свободного места на удалёнке...\n";
     uint64_t avail = remote_bytes_avail(session, "/webserver");
     if (avail == 0) {
-        std::string SUDO = sudo_prefix(session, C);
+        std::string SUDO = sudo_prefix(session, M);
         ssh_exec(session, (SUDO.empty()? "" : (SUDO + " ")) + "mkdir -p /webserver", false);
         avail = remote_bytes_avail(session, "/webserver");
     }
@@ -177,7 +160,7 @@ static int ensure_space_and_bind_mount(ssh_session session, const Config& C, uin
     std::cout << "   Нужно ~" << human_size(need_total) << ", доступно ~" << human_size(avail) << "\n";
     if (avail >= need_total) { std::cout << "✅ Места достаточно на текущем разделе.\n"; return 0; }
     std::cout << "⚠️  Места недостаточно — bind-mount $HOME/webserver -> /webserver...\n";
-    std::string SUDO = sudo_prefix(session, C);
+    std::string SUDO = sudo_prefix(session, M);
     std::string home;
     {
         std::string out;
@@ -187,12 +170,12 @@ static int ensure_space_and_bind_mount(ssh_session session, const Config& C, uin
             if (ssh_exec_capture(session, "getent passwd \"$USER\" | cut -d: -f6", out2, nullptr) == 0 && !trim(out2).empty())
                 home = trim(out2);
         }
-        if (home.empty()) home = "/home/" + C.remote_user;
+        if (home.empty()) home = "/home/" + M.remote_user;
     }
     std::string prep =
         (SUDO.empty()? "" : (SUDO + " ")) + "mkdir -p '" + home + "/webserver' /webserver && "
-        + (C.remote_user=="root" ? "true" :
-           (SUDO.empty()? "" : (SUDO + " ")) + "chown -R " + C.remote_user + ":" + C.remote_user + " '" + home + "/webserver'") + " && "
+        + (M.remote_user=="root" ? "true" :
+           (SUDO.empty()? "" : (SUDO + " ")) + "chown -R " + M.remote_user + ":" + M.remote_user + " '" + home + "/webserver'") + " && "
         + (SUDO.empty()? "" : (SUDO + " ")) + "mountpoint -q /webserver || "
         + (SUDO.empty()? "" : (SUDO + " ")) + "mount --bind '" + home + "/webserver' /webserver && "
         + "echo '" + home + "/webserver /webserver none bind 0 0' | "
@@ -209,11 +192,11 @@ static int ensure_space_and_bind_mount(ssh_session session, const Config& C, uin
 }
 
 // --------------------------- Bootstrap удалёнки ---------------------------
-static int bootstrap_remote(ssh_session session, const Config& C) {
+static int bootstrap_remote(ssh_session session, const Mirror& M) {
     std::cout << "🛠️  Подготовка удалённого хоста...\n";
-    std::string SUDO = sudo_prefix(session, C);
+    std::string SUDO = sudo_prefix(session, M);
     // sudoers
-    if (C.remote_user != "root") {
+    if (M.remote_user != "root") {
         const std::string sudoers = "/etc/sudoers.d/madbackuper";
         std::ostringstream content;
         content << "Cmnd_Alias MADBACKUP_CMDS = "
@@ -223,7 +206,7 @@ static int bootstrap_remote(ssh_session session, const Config& C) {
                 << "/usr/bin/tee, /bin/mkdir, /bin/chown, /bin/chmod, /bin/ln, /bin/cp, /bin/mv, /bin/tar, /usr/bin/find, "
                 << "/bin/mount, /bin/umount, /bin/mountpoint, /usr/bin/grep, /usr/bin/cut, /usr/bin/getent, "
                 << "/usr/bin/mysql, /usr/bin/mysqldump\n"
-                << C.remote_user << " ALL=(root) NOPASSWD: MADBACKUP_CMDS\n";
+                << M.remote_user << " ALL=(root) NOPASSWD: MADBACKUP_CMDS\n";
         std::ostringstream ensure;
         ensure
           << "if [ -f '" << sudoers << "' ]; then "
@@ -243,10 +226,10 @@ static int bootstrap_remote(ssh_session session, const Config& C) {
     {
         std::ostringstream cmd;
         cmd << (SUDO.empty()? "" : (SUDO + " "))
-            << "mkdir -p '" << C.remote_backup_base << "' '" << C.remote_site_dir << "' && ";
-        if (C.remote_user != "root") {
+            << "mkdir -p '" << M.remote_backup_base << "' '" << M.remote_site_dir << "' && ";
+        if (M.remote_user != "root") {
             std::string chown_cmd = (SUDO.empty()? "" : (SUDO + " "));
-            chown_cmd += "chown -R " + C.remote_user + ":" + C.remote_user + " '" + C.remote_backup_base + "'";
+            chown_cmd += "chown -R " + M.remote_user + ":" + M.remote_user + " '" + M.remote_backup_base + "'";
             cmd << chown_cmd;
         } else cmd << "true";
         if (ssh_exec(session, cmd.str(), true) != 0) {
@@ -259,7 +242,7 @@ static int bootstrap_remote(ssh_session session, const Config& C) {
 }
 
 // --------------------------- Команда развёртывания (NGINX) ---------------------------
-static std::string build_nginx_deploy_cmd(const Config& C,
+static std::string build_nginx_deploy_cmd(const Site& S, const Mirror& M,
                                           const std::string& remote_tar,
                                           const std::string& remote_sql,
                                           const std::string& remote_day)
@@ -269,9 +252,9 @@ static std::string build_nginx_deploy_cmd(const Config& C,
         for (char c : s) { if (c == '\\' || c == '"') r.push_back('\\'); r.push_back(c); }
         return r;
     };
-    const std::string php_sock_cfg = C.php_fpm_sock.empty()
-        ? ("/run/php/php" + C.php_version + "-fpm.sock")
-        : C.php_fpm_sock;
+    const std::string php_sock = M.php_fpm_sock.empty()
+        ? ("/run/php/php" + M.php_version + "-fpm.sock")
+        : M.php_fpm_sock;
 
     std::ostringstream root;
     root
@@ -287,206 +270,84 @@ static std::string build_nginx_deploy_cmd(const Config& C,
     << "if [ \"$NGINX_OK\" -ne 1 ]; then echo \"❌ nginx не установлен\" 1>&2; exit 1; fi;\n"
 
     << "echo \"📦 Подготавливаю директории сайта\" 1>&2;\n"
-    << "mkdir -p \"" << dq(C.remote_site_dir) << "\"\n"
-    << "rm -rf \"" << dq(C.remote_site_dir) << ".old\"\n"
-    << "mv \"" << dq(C.remote_site_dir) << "\" \"" << dq(C.remote_site_dir) << ".old\" 2>/dev/null || true\n"
-    << "mkdir -p \"" << dq(C.remote_site_dir) << "\"\n"
+    << "mkdir -p \"" << dq(M.remote_site_dir) << "\"\n"
+    << "rm -rf \"" << dq(M.remote_site_dir) << ".old\"\n"
+    << "mv \"" << dq(M.remote_site_dir) << "\" \"" << dq(M.remote_site_dir) << ".old\" 2>/dev/null || true\n"
+    << "mkdir -p \"" << dq(M.remote_site_dir) << "\"\n"
 
     << "echo \"📤 Распаковка архива сайта\" 1>&2;\n"
     << "if command -v pv >/dev/null 2>&1; then "
-         "pv -f -p -t -e -r -b \"" << dq(remote_tar) << "\" | tar -xzf - -C \"" << dq(C.remote_site_dir) << "\"; "
+         "pv -f -p -t -e -r -b \"" << dq(remote_tar) << "\" | tar -xzf - -C \"" << dq(M.remote_site_dir) << "\"; "
        "else "
-         "tar -xzf \"" << dq(remote_tar) << "\" -C \"" << dq(C.remote_site_dir) << "\" --checkpoint=500 --checkpoint-action=echo=. ; echo; "
+         "tar -xzf \"" << dq(remote_tar) << "\" -C \"" << dq(M.remote_site_dir) << "\" --checkpoint=500 --checkpoint-action=echo=. ; echo; "
        "fi\n"
 
     << "REF=$(mktemp); touch \"$REF\"; "
-       "find \"" << dq(C.remote_site_dir) << "\" \\( -type f -o -type d \\) -newer \"$REF\" -print0 | xargs -0 -r touch -r \"$REF\"; "
+       "find \"" << dq(M.remote_site_dir) << "\" \\( -type f -o -type d \\) -newer \"$REF\" -print0 | xargs -0 -r touch -r \"$REF\"; "
        "rm -f \"$REF\"\n"
 
     << "echo \"🧰 Выставляю права\" 1>&2;\n"
-    << "chown -R www-data:www-data \"" << dq(C.remote_site_dir) << "\" || true\n"
-    << "find \"" << dq(C.remote_site_dir) << "\" -type d -exec chmod 755 {} \\; || true\n"
-    << "find \"" << dq(C.remote_site_dir) << "\" -type f -exec chmod 644 {} \\; || true\n"
+    << "chown -R www-data:www-data \"" << dq(M.remote_site_dir) << "\" || true\n"
+    << "find \"" << dq(M.remote_site_dir) << "\" -type d -exec chmod 755 {} \\; || true\n"
+    << "find \"" << dq(M.remote_site_dir) << "\" -type f -exec chmod 644 {} \\; || true\n"
 
     // БД
     << "echo \"🗄️  Подготавливаю БД и пользователя (MariaDB)\" 1>&2;\n"
     << "/usr/bin/mysql -uroot <<\\SQL\n"
-       "CREATE DATABASE IF NOT EXISTS `" << C.db_name << "` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
-       "CREATE USER IF NOT EXISTS '" << C.db_user << "'@'localhost' IDENTIFIED BY '" << C.db_pass << "';\n"
-       "CREATE USER IF NOT EXISTS '" << C.db_user << "'@'127.0.0.1' IDENTIFIED BY '" << C.db_pass << "';\n"
-       "GRANT ALL ON `" << C.db_name << "`.* TO '" << C.db_user << "'@'localhost';\n"
-       "GRANT ALL ON `" << C.db_name << "`.* TO '" << C.db_user << "'@'127.0.0.1';\n"
+       "CREATE DATABASE IF NOT EXISTS `" << S.db_name << "` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
+       "CREATE USER IF NOT EXISTS '" << S.db_user << "'@'localhost' IDENTIFIED BY '" << S.db_pass << "';\n"
+       "CREATE USER IF NOT EXISTS '" << S.db_user << "'@'127.0.0.1' IDENTIFIED BY '" << S.db_pass << "';\n"
+       "GRANT ALL ON `" << S.db_name << "`.* TO '" << S.db_user << "'@'localhost';\n"
+       "GRANT ALL ON `" << S.db_name << "`.* TO '" << S.db_user << "'@'127.0.0.1';\n"
        "FLUSH PRIVILEGES;\n"
     "SQL\n"
     << "echo \"📦 Бэкап прежней БД (мягко)\" 1>&2;\n"
-    << "/usr/bin/mysqldump \"" << dq(C.db_name) << "\" > \"" << dq(remote_day) << "/db_old.sql\" 2>/dev/null || true\n"
+    << "/usr/bin/mysqldump \"" << dq(S.db_name) << "\" > \"" << dq(remote_day) << "/db_old.sql\" 2>/dev/null || true\n"
     << "DB_IMPORTED=0; TABLES_AFTER=0;\n"
     << "if [ -s \"" << dq(remote_sql) << "\" ]; then "
          "echo \"⬇️  Импортирую дамп\" 1>&2; "
-         "/usr/bin/mysql \"" << dq(C.db_name) << "\" < \"" << dq(remote_sql) << "\" && DB_IMPORTED=1; "
+         "/usr/bin/mysql \"" << dq(S.db_name) << "\" < \"" << dq(remote_sql) << "\" && DB_IMPORTED=1; "
        "else "
          "echo \"⚠️ Дамп не найден или пуст — пропуск\" 1>&2; "
        "fi\n"
     << "TABLES_AFTER=$(/usr/bin/mysql -NBe \"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='"
-      << dq(C.db_name) << "'\" 2>/dev/null || echo 0)\n"
+      << dq(S.db_name) << "'\" 2>/dev/null || echo 0)\n"
     << "echo \"   📊 Таблиц в БД после импорта: $TABLES_AFTER\" 1>&2;\n"
 
-    // setup_madmentat_nginx.sh + wachdog
-    << "echo \"🧩 Проверяю /root/setup_madmentat_nginx.sh\" 1>&2;\n"
-    << "if [ ! -x /root/setup_madmentat_nginx.sh ]; then\n"
-    << "  echo \"✍️  Пишу /root/setup_madmentat_nginx.sh\" 1>&2;\n"
-    << "  umask 077; cat > /root/setup_madmentat_nginx.sh <<'EOS'\n"
-    << "#!/usr/bin/env bash\n"
-       "set -euo pipefail\n"
-       "ts(){ date +\"[%H:%M:%S]\"; }\n"
-       "log(){ echo \"$(ts) $*\"; }\n"
-       "DOMAIN=\"" << dq(C.server_name) << "\"; WWW=\"www.${DOMAIN}\"\n"
-       "WEBROOT=\"" << dq(C.remote_site_dir) << "\"\n"
-       "FRONT_AVAIL=\"/etc/nginx/sites-available/${DOMAIN}.conf\"\n"
-       "FRONT_ENABLED=\"/etc/nginx/sites-enabled/${DOMAIN}.conf\"\n"
-       "LOCAL_AVAIL=\"/etc/nginx/sites-available/${DOMAIN}.local.conf\"\n"
-       "LOCAL_ENABLED=\"/etc/nginx/sites-enabled/${DOMAIN}.local.conf\"\n"
-       "BACKEND_CONF=\"/etc/nginx/conf.d/${DOMAIN}.backend.conf\"\n"
-       "BACKEND_LOCAL=\"http://127.0.0.1:8081\"\n"
-       "BACKEND_REMOTE=\"http://192.168.88.198\"\n"
-       "pick_cert_dir(){ for d in \"/etc/letsencrypt/live/${DOMAIN}-0002\" \"/etc/letsencrypt/live/${DOMAIN}\"; do\n"
-       "  [ -s \"$d/fullchain.pem\" ] && [ -s \"$d/privkey.pem\" ] && { echo \"$d\"; return 0; }\n"
-       "done; return 1; }\n"
-       "detect_php_sock(){ for s in /run/php/php*-fpm.sock; do [ -S \"$s\" ] && { echo \"$s\"; return 0; }; done; echo \"/run/php/php-fpm.sock\"; }\n"
-       "CERT_DIR=\"$(pick_cert_dir || true)\"; [ -z \"${CERT_DIR:-}\" ] && CERT_DIR=\"/etc/letsencrypt/live/${DOMAIN}-0002\"\n"
-       "CERT_FULL=\"${CERT_DIR}/fullchain.pem\"; CERT_KEY=\"${CERT_DIR}/privkey.pem\"\n"
-       "PHP_SOCK=\"$(detect_php_sock)\"\n"
-       "MODE=\"${1:-status}\"; OVERRIDE_REMOTE=\"${2:-}\"\n"
-       "case \"$MODE\" in\n"
-       "  local)  TARGET=\"$BACKEND_LOCAL\" ;;\n"
-       "  remote) TARGET=\"${OVERRIDE_REMOTE:-$BACKEND_REMOTE}\" ;;\n"
-       "  status) TARGET=\"\" ;;\n"
-       "  *) echo \"Usage: $0 {local|remote|status} [remote_url]\"; exit 1 ;;\n"
-       "esac\n"
-       "mkdir -p /etc/nginx/disabled\n"
-       "for f in \\\n"
-       "  \"/etc/nginx/sites-enabled/${DOMAIN}.local.conf\" \\\n"
-       "  \"/etc/nginx/sites-available/${DOMAIN}.local.conf\" \\\n"
-       "  \"/etc/nginx/sites-enabled/setup_${DOMAIN}_nginx.sh\" \\\n"
-       "  \"/etc/nginx/sites-available/setup_${DOMAIN}_nginx.sh\" \\\n"
-       "  ; do\n"
-       "  [ -e \"$f\" ] || continue\n"
-       "  log \"Карантин: $f\"; mv -f \"$f\" \"/etc/nginx/disabled/$(basename \"$f\").$(date +%Y%m%d-%H%M%S)\"\n"
-       "done\n"
-       "if [ -n \"$TARGET\" ]; then\n"
-       "  log \"Пишу ${BACKEND_CONF} -> ${TARGET}\"; echo \"set \\$mad_backend ${TARGET};\" > \"${BACKEND_CONF}\"\n"
-       "else\n"
-       "  log \"Статус: BACKEND не меняю (${BACKEND_CONF})\"\n"
-       "fi\n"
-       "log \"Готовлю локальный backend ${LOCAL_AVAIL} (127.0.0.1:8081)\"\n"
-       "cat > \"${LOCAL_AVAIL}\" <<EOF\n"
-       "server {\n"
-       "    listen 127.0.0.1:8081;\n"
-       "    server_name _;\n"
-       "    root ${WEBROOT};\n"
-       "    index index.php index.html;\n"
-       "    access_log /var/log/nginx/${DOMAIN}.local.access.log;\n"
-       "    error_log  /var/log/nginx/${DOMAIN}.local.error.log;\n"
-       "    location / { try_files \\$uri \\$uri/ /index.php?\\$args; }\n"
-       "    location ~ \\.php$ { include snippets/fastcgi-php.conf; fastcgi_pass unix:${PHP_SOCK}; }\n"
-       "    client_max_body_size 1024m;\n"
-       "}\n"
-       "EOF\n"
-       "ln -sf \"${LOCAL_AVAIL}\" \"${LOCAL_ENABLED}\"\n"
-       "log \"Пишу фронт ${FRONT_AVAIL}\"\n"
-       "cat > \"${FRONT_AVAIL}\" <<EOF\n"
-       "server {\n"
-       "    listen 80;\n"
-       "    listen [::]:80;\n"
-       "    server_name ${DOMAIN} ${WWW};\n"
-       "    client_max_body_size 1024m;\n"
-       "    return 301 https://\\$host\\$request_uri;\n"
-       "}\n"
-       "server {\n"
-       "    listen 443 ssl http2;\n"
-       "    listen [::]:443 ssl http2;\n"
-       "    server_name ${DOMAIN} ${WWW};\n"
-       "    ssl_certificate     ${CERT_FULL};\n"
-       "    ssl_certificate_key ${CERT_KEY};\n"
-       "    include /etc/letsencrypt/options-ssl-nginx.conf;\n"
-       "    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;\n"
-       "    include ${BACKEND_CONF};\n"
-       "    location / {\n"
-       "        proxy_pass \\$mad_backend;\n"
-       "        proxy_set_header Host               \\$host;\n"
-       "        proxy_set_header X-Real-IP          \\$remote_addr;\n"
-       "        proxy_set_header X-Forwarded-For    \\$proxy_add_x_forwarded_for;\n"
-       "        proxy_set_header X-Forwarded-Proto  \\$scheme;\n"
-       "    }\n"
-       "    client_max_body_size 1024m;\n"
-       "}\n"
-       "EOF\n"
-       "ln -sf \"${FRONT_AVAIL}\" \"${FRONT_ENABLED}\"\n"
-       "log \"Чищу конфликты server_name с ${DOMAIN}\"\n"
-       "shopt -s nullglob\n"
-       "for f in /etc/nginx/sites-available/* /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do\n"
-       "  [ -f \"$f\" ] || continue\n"
-       "  case \"$f\" in\n"
-       "    \"$FRONT_AVAIL\"|\"$FRONT_ENABLED\"|\"$LOCAL_AVAIL\"|\"$LOCAL_ENABLED\"|\"$BACKEND_CONF\") continue ;;\n"
-       "  esac\n"
-       "  if grep -Eq '^\\s*server_name\\s+.*(" << dq(C.server_name) << "|www\\." << dq(C.server_name) << ")\\b' \"$f\"; then\n"
-       "    log \"→ Убираю ${DOMAIN} из $f\"\n"
-       "    sed -ri '\n"
-       "      /^\\s*server_name/{\n"
-       "        s/[[:space:]]+" << dq(C.server_name) << "\\b//g;\n"
-       "        s/[[:space:]]+www\\." << dq(C.server_name) << "\\b//g;\n"
-       "        s/server_name[[:space:]]*;$/server_name _;/;\n"
-       "      }' \"$f\"\n"
-       "  fi\n"
-       "done\n"
-       "shopt -u nullglob\n"
-       "if ! grep -Eq 'include\\s+/etc/nginx/sites-enabled/\\*;' /etc/nginx/nginx.conf; then\n"
-       "  log \"Добавляю include /etc/nginx/sites-enabled/*; в nginx.conf (внутрь http{})\"\n"
-       "  sed -ri '/http\\s*\\{/a\\    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf\n"
-       "fi\n"
-       "log \"Проверяю конфиг nginx\"; nginx -t\n"
-       "log \"Перегружаю nginx\"; systemctl reload nginx\n"
-       "if ss -lntp 2>/dev/null | grep -q ':8081 '; then log \"Локальный backend 8081 слушается\"; else log \"⚠️  8081 не слушается — проверь ${LOCAL_AVAIL} и error_log\"; fi\n"
-       "current_backend=\"$(awk '/^\\s*set\\s+\\$mad_backend/{print $3}' \"${BACKEND_CONF}\" 2>/dev/null | tr -d ' ;' || true)\"; log \"Текущий backend: ${current_backend:-unknown}\"\n"
-       "if command -v openssl >/dev/null 2>&1; then\n"
-       "  log \"Проверяю SNI-сертификат для ${DOMAIN}\"\n"
-       "  openssl s_client -connect 127.0.0.1:443 -servername \"${DOMAIN}\" </dev/null 2>/dev/null | openssl x509 -noout -subject -issuer | sed 's/^/   /'\n"
-       "fi\n"
-       "log \"Готово. Переключение:\"\n"
-       "echo \"  sudo $0 local   # прокси на 127.0.0.1:8081\"\n"
-       "echo \"  sudo $0 remote  # прокси на 192.168.88.198\"\n"
-    << "EOS\n"
-    << "  chmod 700 /root/setup_madmentat_nginx.sh\n"
-    << "else\n"
-    << "  echo \"✅ Нашёл /root/setup_madmentat_nginx.sh\" 1>&2;\n"
+    // Локальный backend-конфиг (публичный фронт — на отдельном proxy)
+    << "echo \"🧩 Пишу локальный backend-конфиг nginx\" 1>&2;\n"
+    << "LOCAL_AVAIL=\"/etc/nginx/sites-available/" << dq(S.server_name) << ".local.conf\"\n"
+    << "LOCAL_ENABLED=\"/etc/nginx/sites-enabled/" << dq(S.server_name) << ".local.conf\"\n"
+    << "cat > \"$LOCAL_AVAIL\" <<'NGINX_LOCAL'\n"
+    << "server {\n"
+    << "    listen " << M.local_http_port << ";\n"
+    << "    server_name " << S.server_name << ";\n"
+    << "    root " << M.remote_site_dir << ";\n"
+    << "    index index.php index.html;\n"
+    << "    location ~ \\.php$ {\n"
+    << "        fastcgi_pass unix:" << php_sock << ";\n"
+    << "        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;\n"
+    << "        include fastcgi_params;\n"
+    << "    }\n"
+    << "}\n"
+    << "NGINX_LOCAL\n"
+    << "ln -sf \"$LOCAL_AVAIL\" \"$LOCAL_ENABLED\"\n"
+    << "if ! grep -Eq 'include\\s+/etc/nginx/sites-enabled/\\*;' /etc/nginx/nginx.conf; then\n"
+    << "  echo \"➕ Добавляю include /etc/nginx/sites-enabled/*; в nginx.conf (внутрь http{})\" 1>&2;\n"
+    << "  sed -ri '/http\\s*\\{/a\\    include /etc/nginx/sites-enabled/*;' /etc/nginx/nginx.conf\n"
     << "fi\n"
+    << "echo \"🔍 Проверяю конфиг nginx\" 1>&2; nginx -t\n"
+    << "echo \"🔄 Перезагружаю nginx\" 1>&2; systemctl reload nginx\n"
 
-    << "echo \"🔀 Запускаю переключение фронта на remote\" 1>&2;\n"
-    << "/root/setup_madmentat_nginx.sh remote || { echo \"❌ Ошибка переключения\" 1>&2; exit 1; }\n"
-
-    << "echo \"🐶 Обновляю /webserver/wachdog\" 1>&2;\n"
-    << "mkdir -p /webserver || true\n"
-    << "WD=/webserver/wachdog\n"
-    << "if [ -f \"$WD\" ]; then\n"
-    << "  if grep -Eq '^madmentat\\.ru_update=false\\b' \"$WD\"; then\n"
-    << "    sed -ri 's/^madmentat\\.ru_update=false\\b/madmentat.ru_update=true/' \"$WD\"\n"
-    << "    echo \"   → madmentat.ru_update=true (из false)\" 1>&2;\n"
-    << "  else\n"
-    << "    if ! grep -Eq '^madmentat\\.ru_update=' \"$WD\"; then echo 'madmentat.ru_update=true' >> \"$WD\"; echo \"   → добавил madmentat.ru_update=true\" 1>&2; else echo \"   → уже true или отсутствует false\" 1>&2; fi\n"
-    << "  fi\n"
-    << "else\n"
-    << "  echo 'madmentat.ru_update=true' > \"$WD\"\n"
-    << "  echo \"   → создан $WD с madmentat.ru_update=true\" 1>&2;\n"
-    << "fi\n"
+    << "echo \"🧹 Ротация старых бэкапов (7+ дней)\" 1>&2;\n"
+    << "find \"" << dq(M.remote_backup_base) << "\" -maxdepth 1 -type d -regextype posix-extended -regex '.*/[0-9]{4}-[0-9]{2}-[0-9]{2}$' -mtime +7 -exec rm -rf {} +\n"
 
     << "echo \"——— Итог ———\" 1>&2;\n"
     << "echo \"✅ Импорт БД:       ${DB_IMPORTED}\" 1>&2;\n"
     << "echo \"📊 Таблиц в БД:     ${TABLES_AFTER}\" 1>&2;\n"
-    << "echo \"✅ Скрипт nginx:     /root/setup_madmentat_nginx.sh\" 1>&2;\n"
-    << "echo \"✅ Фронт:            remote (см. /etc/nginx/conf.d/" << dq(C.server_name) << ".backend.conf)\" 1>&2;\n"
-    << "echo \"✅ Вачдог:           $(grep -E '^madmentat\\.ru_update=' \"$WD\" || echo '-')\" 1>&2;\n";
+    << "echo \"✅ Локальный backend: /etc/nginx/sites-available/" << dq(S.server_name) << ".local.conf (listen " << M.local_http_port << ")\" 1>&2;\n";
 
-    const std::string sudopw   = C.remote_sudo_pass.empty() ? C.remote_pass : C.remote_sudo_pass;
+    const std::string sudopw   = M.remote_sudo_pass.empty() ? M.remote_pass : M.remote_sudo_pass;
     const std::string pass_b64 = base64_encode(sudopw);
     std::ostringstream wrapper;
     wrapper
@@ -505,26 +366,27 @@ static std::string build_nginx_deploy_cmd(const Config& C,
 }
 
 // --------------------------- Команда развёртывания (APACHE) ---------------------------
-static std::string build_apache_deploy_cmd(const Config& C,
+static std::string build_apache_deploy_cmd(const Site& S, const Mirror& M,
                                            const std::string& remote_tar,
                                            const std::string& remote_sql,
                                            const std::string& remote_day) {
-    const std::string conf_avail = "/etc/apache2/sites-available/" + C.server_name + ".local.conf";
-    std::string php_sock = C.php_fpm_sock.empty()
-        ? ("/run/php/php" + C.php_version + "-fpm.sock")
-        : C.php_fpm_sock;
+    const std::string conf_avail = "/etc/apache2/sites-available/" + S.server_name + ".local.conf";
+    std::string php_sock = M.php_fpm_sock.empty()
+        ? ("/run/php/php" + M.php_version + "-fpm.sock")
+        : M.php_fpm_sock;
     std::ostringstream tpl;
     tpl
-    << "<VirtualHost *:" << C.local_http_port << ">\n"
-    << "    ServerName " << C.server_name << "\n"
-    << "    DocumentRoot " << C.remote_site_dir << "\n"
-    << "    <Directory " << C.remote_site_dir << ">\n"
+    << "Listen " << M.local_http_port << "\n"
+    << "<VirtualHost *:" << M.local_http_port << ">\n"
+    << "    ServerName " << S.server_name << "\n"
+    << "    DocumentRoot " << M.remote_site_dir << "\n"
+    << "    <Directory " << M.remote_site_dir << ">\n"
     << "        Options Indexes FollowSymLinks\n"
     << "        AllowOverride All\n"
     << "        Require all granted\n"
     << "    </Directory>\n"
-    << "    ErrorLog ${APACHE_LOG_DIR}/" << C.server_name << "_error.log\n"
-    << "    CustomLog ${APACHE_LOG_DIR}/" << C.server_name << "_access.log combined\n"
+    << "    ErrorLog ${APACHE_LOG_DIR}/" << S.server_name << "_error.log\n"
+    << "    CustomLog ${APACHE_LOG_DIR}/" << S.server_name << "_access.log combined\n"
     << "    <FilesMatch \\.php$>\n"
     << "        SetHandler \"proxy:unix:" << php_sock << "|fcgi://localhost/\"\n"
     << "    </FilesMatch>\n"
@@ -534,78 +396,80 @@ static std::string build_apache_deploy_cmd(const Config& C,
     cmd
     << "set -e; "
     << "SUDO='sudo -n'; if ! $SUDO true 2>/dev/null; then SUDO=\"echo '"
-    << sh_escape_single(C.remote_sudo_pass.empty() ? C.remote_pass : C.remote_sudo_pass)
+    << sh_escape_single(M.remote_sudo_pass.empty() ? M.remote_pass : M.remote_sudo_pass)
     << "' | sudo -S -p ''\"; fi; "
     << "echo '→ Проверка окружения (apache2/php-fpm/mysql/tar)'; "
     << "command -v apache2ctl >/dev/null || { echo '❌ apache2ctl не найден'; exit 1; }; "
     << "command -v tar        >/dev/null || { echo '❌ tar не установлен'; exit 1; }; "
     << "command -v mysql      >/dev/null || { echo '❌ mysql клиент не установлен'; exit 1; }; "
-    << "if ! command -v php-fpm >/dev/null && ! command -v php-fpm" << C.php_version << " >/dev/null; then "
+    << "if ! command -v php-fpm >/dev/null && ! command -v php-fpm" << M.php_version << " >/dev/null; then "
          "echo '❌ PHP-FPM не найден'; exit 1; "
        "fi; "
     << "PHP_SOCK='" << php_sock << "'; "
     << "[ -S \"$PHP_SOCK\" ] || { echo \"❌ Нет сокета PHP-FPM: $PHP_SOCK\"; ls -l /run/php || true; exit 1; }; "
     << "echo '→ Обновление рабочей копии'; "
-    << "mkdir -p '" << C.remote_site_dir << "'; "
-    << "rm -rf '" << C.remote_site_dir << "'.old; "
-    << "mv '" << C.remote_site_dir << "' '" << C.remote_site_dir << ".old' 2>/dev/null || true; "
-    << "mkdir -p '" << C.remote_site_dir << "'; "
+    << "$SUDO /bin/mkdir -p '" << M.remote_site_dir << "'; "
+    << "$SUDO /bin/rm -rf '" << M.remote_site_dir << "'.old; "
+    << "$SUDO /bin/mv '" << M.remote_site_dir << "' '" << M.remote_site_dir << ".old' 2>/dev/null || true; "
+    << "$SUDO /bin/mkdir -p '" << M.remote_site_dir << "'; "
+    << "$SUDO /bin/chown " << M.remote_user << " '" << M.remote_site_dir << "'; "
 
     << "echo '→ Распаковка сайта (прогресс)'; "
     << "if command -v pv >/dev/null 2>&1; then "
-         "pv -f -p -t -e -r -b '" << remote_tar << "' | tar -xzf - -C '" << C.remote_site_dir << "'; "
+         "pv -f -p -t -e -r -b '" << remote_tar << "' | tar -xzf - -C '" << M.remote_site_dir << "'; "
        "else "
          "echo '   pv не найден — индикатор точками'; "
-         "tar -xzf '" << remote_tar << "' -C '" << C.remote_site_dir << "' --checkpoint=500 --checkpoint-action=echo=. ; echo; "
+         "tar -xzf '" << remote_tar << "' -C '" << M.remote_site_dir << "' --checkpoint=500 --checkpoint-action=echo=. ; echo; "
        "fi; "
 
     << "echo '→ Права'; "
-    << "$SUDO /bin/chown -R www-data:www-data '" << C.remote_site_dir << "' || true; "
-    << "find '" << C.remote_site_dir << "' -type d -exec /bin/chmod 755 {} \\; || true; "
-    << "find '" << C.remote_site_dir << "' -type f -exec /bin/chmod 644 {} \\; || true; "
+    << "$SUDO /bin/chown -R www-data:www-data '" << M.remote_site_dir << "' || true; "
+    << "find '" << M.remote_site_dir << "' -type d -exec $SUDO /bin/chmod 755 {} \\; || true; "
+    << "find '" << M.remote_site_dir << "' -type f -exec $SUDO /bin/chmod 644 {} \\; || true; "
 
     << "echo '→ Apache vhost'; "
     << "TMPCONF=$(mktemp) && printf '%s' '" << sh_escape_single(tpl.str()) << "' > \"$TMPCONF\" && "
        "$SUDO /bin/mv \"$TMPCONF\" '" << conf_avail << "'; "
+    << "$SUDO /bin/chmod 644 '" << conf_avail << "'; "
     << "$SUDO /usr/sbin/a2enmod proxy proxy_fcgi setenvif rewrite >/dev/null || true; "
-    << "$SUDO /usr/sbin/a2ensite '" << C.server_name << ".local.conf' >/dev/null || true; "
+    << "$SUDO /usr/sbin/a2ensite '" << S.server_name << ".local.conf' >/dev/null || true; "
     << "echo '→ apache2ctl configtest'; $SUDO /usr/sbin/apache2ctl configtest; "
 
     << "echo '→ Подготовка БД и пользователя (через root)'; "
     << "$SUDO /usr/bin/mysql -uroot -e \""
-         "CREATE DATABASE IF NOT EXISTS \\`" << C.db_name << "\\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; "
-         "CREATE USER IF NOT EXISTS '" << C.db_user << "'@'localhost' IDENTIFIED BY '" << C.db_pass << "'; "
-         "CREATE USER IF NOT EXISTS '" << C.db_user << "'@'127.0.0.1' IDENTIFIED BY '" << C.db_pass << "'; "
-         "GRANT ALL ON \\`" << C.db_name << "\\`.* TO "
-             "'" << C.db_user << "'@'localhost', "
-             "'" << C.db_user << "'@'127.0.0.1'; "
+         "CREATE DATABASE IF NOT EXISTS \\`" << S.db_name << "\\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; "
+         "CREATE USER IF NOT EXISTS '" << S.db_user << "'@'localhost' IDENTIFIED BY '" << S.db_pass << "'; "
+         "CREATE USER IF NOT EXISTS '" << S.db_user << "'@'127.0.0.1' IDENTIFIED BY '" << S.db_pass << "'; "
+         "GRANT ALL ON \\`" << S.db_name << "\\`.* TO "
+             "'" << S.db_user << "'@'localhost', "
+             "'" << S.db_user << "'@'127.0.0.1'; "
          "FLUSH PRIVILEGES;\"; "
 
     << "echo '→ Бэкап текущей БД на резерве (мягко)'; "
-    << "$SUDO /usr/bin/mysqldump " << C.db_name << " > '" << remote_day << "/db_old.sql' 2>/dev/null || true; "
+    << "$SUDO /usr/bin/mysqldump " << S.db_name << " > '" << remote_day << "/db_old.sql' 2>/dev/null || true; "
 
     << "echo '→ Импорт новой БД (через root)'; "
-    << "$SUDO /usr/bin/mysql " << C.db_name << " < '" << remote_sql << "'; "
+    << "$SUDO /usr/bin/mysql " << S.db_name << " < '" << remote_sql << "'; "
 
     << "echo '→ Перезапуск apache2'; $SUDO /bin/systemctl restart apache2; "
     << "echo '→ Ротация'; "
-    << "find '" << C.remote_backup_base << "' -maxdepth 1 -type d "
+    << "find '" << M.remote_backup_base << "' -maxdepth 1 -type d "
        "-regextype posix-extended -regex '.*/[0-9]{4}-[0-9]{2}-[0-9]{2}$' -mtime +7 -exec rm -rf {} + ; "
     << "echo '✓ Apache: развёртывание завершено';";
     return cmd.str();
 }
 
 // --------------------------- Один «рабочий прогон» ---------------------------
-static int run_once(const Config& cfg) {
-    std::cout << "📁 Локальный сайт: " << cfg.local_site_dir << "\n";
-    std::cout << "🛢️  База: " << cfg.db_name << " (user: " << cfg.db_user << ")\n";
-    std::cout << "🌐 Резерв: " << cfg.remote_user << "@" << cfg.remote_host << ":" << cfg.remote_site_dir
-              << " (" << cfg.target_server << ")\n";
-    std::cout << "🔄 Локальные порты сайта: " << cfg.local_http_port
-              << (cfg.local_https_port>0?("/"+std::to_string(cfg.local_https_port)):"")
-              << " | switch_to_local=" << (cfg.switch_to_local ? "yes":"no") << "\n";
+static int run_once(const Site& S, const Mirror& M,
+                    bool skip_tar, bool skip_sql, bool skip_upload) {
+    std::cout << "📁 Локальный сайт: " << S.local_site_dir << "\n";
+    std::cout << "🛢️  База: " << S.db_name << " (user: " << S.db_user << ")\n";
+    std::cout << "🌐 Резерв: " << M.remote_user << "@" << M.remote_host << ":" << M.remote_site_dir
+              << " (" << M.target_server << ")\n";
+    std::cout << "🔄 Локальные порты сайта: " << M.local_http_port
+              << (M.local_https_port>0?("/"+std::to_string(M.local_https_port)):"") << "\n";
 
-    if (!fs::exists(cfg.local_site_dir)) { std::cerr << "❌ Нет каталога: " << cfg.local_site_dir << "\n"; return 1; }
+    if (!fs::exists(S.local_site_dir)) { std::cerr << "❌ Нет каталога: " << S.local_site_dir << "\n"; return 1; }
 
     // Артефакты (каждый прогон — своя дата)
     const std::string date = today();
@@ -616,27 +480,27 @@ static int run_once(const Config& cfg) {
     fs::create_directories(tmp_dir);
 
     // DB creds (0600)
-    { std::ofstream cnf(cnf_path); cnf << "[client]\nuser=" << cfg.db_user << "\npassword=" << cfg.db_pass << "\n";
+    { std::ofstream cnf(cnf_path); cnf << "[client]\nuser=" << S.db_user << "\npassword=" << S.db_pass << "\n";
       cnf.close(); chmod(cnf_path.c_str(), 0600); }
 
     // Архивация
     std::cout << "📦 Архивация сайта...\n";
-    if (cfg.skip_tar && fs::exists(tar_path) && fs::file_size(tar_path) > 0) {
+    if (skip_tar && fs::exists(tar_path) && fs::file_size(tar_path) > 0) {
         std::cout << "⏭ --skip-tar: найден готовый архив: " << tar_path
                   << " (" << human_size((uint64_t)fs::file_size(tar_path)) << "), пропускаю упаковку.\n";
     } else {
-        if (cfg.skip_tar) std::cout << "⚠️  --skip-tar запрошен, но архив не найден — создаю новый.\n";
-        uint64_t total_bytes = dir_size_bytes(cfg.local_site_dir);
+        if (skip_tar) std::cout << "⚠️  --skip-tar запрошен, но архив не найден — создаю новый.\n";
+        uint64_t total_bytes = dir_size_bytes(S.local_site_dir);
         std::cout << "   Размер каталога: ~" << human_size(total_bytes) << "\n";
         int rc_archive = 0;
         if (has_command("pv")) {
             std::cout << "   Использую pv для прогресса…\n";
-            std::ostringstream cmd; cmd << "tar -C '" << cfg.local_site_dir << "' -cf - . | pv -s " << total_bytes
+            std::ostringstream cmd; cmd << "tar -C '" << S.local_site_dir << "' -cf - . | pv -s " << total_bytes
                                         << " | gzip > '" << tar_path << "'";
             rc_archive = run_local(cmd.str());
         } else {
             std::cout << "   ℹ️ pv не найден — покажу спиннер (sudo apt install pv)\n";
-            std::ostringstream cmd; cmd << "tar -czf '" << tar_path << "' -C '" << cfg.local_site_dir << "' .";
+            std::ostringstream cmd; cmd << "tar -czf '" << tar_path << "' -C '" << S.local_site_dir << "' .";
             rc_archive = run_with_spinner(cmd.str(), "Архивация");
         }
         if (rc_archive != 0) { unlink(cnf_path.c_str()); return 1; }
@@ -645,13 +509,13 @@ static int run_once(const Config& cfg) {
 
     // Дамп БД
     std::cout << "🛢️  Дамп базы...\n";
-    if (cfg.skip_sql && fs::exists(sql_path) && fs::file_size(sql_path) > 0) {
+    if (skip_sql && fs::exists(sql_path) && fs::file_size(sql_path) > 0) {
         std::cout << "⏭ --skip-sql: найден существующий дамп: " << sql_path << "\n";
     } else {
-        if (cfg.skip_sql) std::cout << "⚠️  --skip-sql запрошен, но дамп не найден — делаю новый.\n";
+        if (skip_sql) std::cout << "⚠️  --skip-sql запрошен, но дамп не найден — делаю новый.\n";
         std::string cmd = "mysqldump --defaults-extra-file='" + cnf_path + "' "
                           "--single-transaction --quick --routines --triggers --events --no-tablespaces "
-                          + cfg.db_name + " > '" + sql_path + "' 2> '" + tmp_dir + "/mysqldump.err'";
+                          + S.db_name + " > '" + sql_path + "' 2> '" + tmp_dir + "/mysqldump.err'";
         if (run_local(cmd, /*echo=*/false) != 0) { unlink(cnf_path.c_str()); return 1; }
         std::cout << "✅ Дамп: " << sql_path << "\n";
     }
@@ -662,30 +526,30 @@ static int run_once(const Config& cfg) {
     if (!session) { std::cerr << "❌ ssh_new\n"; return 1; }
     int timeout = 30;
     ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeout);
-    ssh_options_set(session, SSH_OPTIONS_HOST, cfg.remote_host.c_str());
-    ssh_options_set(session, SSH_OPTIONS_USER, cfg.remote_user.c_str());
-    ssh_options_set(session, SSH_OPTIONS_PORT, &cfg.ssh_port);
-    std::cout << "🔌 Подключаемся к " << cfg.remote_host << ":" << cfg.ssh_port << "...\n";
+    ssh_options_set(session, SSH_OPTIONS_HOST, M.remote_host.c_str());
+    ssh_options_set(session, SSH_OPTIONS_USER, M.remote_user.c_str());
+    ssh_options_set(session, SSH_OPTIONS_PORT, &M.ssh_port);
+    std::cout << "🔌 Подключаемся к " << M.remote_host << ":" << M.ssh_port << "...\n";
     if (ssh_connect(session) != SSH_OK) { std::cerr << "❌ ssh_connect: " << ssh_get_error(session) << "\n"; ssh_free(session); return 1; }
     std::cout << "✅ Соединение установлено (" << peer_ip(session) << ")\n";
-    if (ssh_userauth_password(session, nullptr, cfg.remote_pass.c_str()) != SSH_AUTH_SUCCESS) {
+    if (ssh_userauth_password(session, nullptr, M.remote_pass.c_str()) != SSH_AUTH_SUCCESS) {
         std::cerr << "❌ Аутентификация: " << ssh_get_error(session) << "\n"; ssh_disconnect(session); ssh_free(session); return 1;
     }
 
     // Подготовка места
     uint64_t need_bytes = 0; try { need_bytes += fs::file_size(tar_path); } catch (...) {}
                              try { need_bytes += fs::file_size(sql_path); } catch (...) {}
-    if (ensure_space_and_bind_mount(session, cfg, need_bytes) != 0) { ssh_disconnect(session); ssh_free(session); return 1; }
+    if (ensure_space_and_bind_mount(session, M, need_bytes) != 0) { ssh_disconnect(session); ssh_free(session); return 1; }
 
     // Bootstrap
-    if (bootstrap_remote(session, cfg) != 0) std::cerr << "⚠️  Подготовка удалёнки с предупреждениями.\n";
+    if (bootstrap_remote(session, M) != 0) std::cerr << "⚠️  Подготовка удалёнки с предупреждениями.\n";
 
     // SFTP
     sftp_session sftp = sftp_new(session);
     if (!sftp) { std::cerr << "❌ sftp_new\n"; ssh_disconnect(session); ssh_free(session); return 1; }
     if (sftp_init(sftp) != SSH_OK) { std::cerr << "❌ sftp_init: " << ssh_get_error(session) << "\n"; sftp_free(sftp); ssh_disconnect(session); ssh_free(session); return 1; }
 
-    const std::string remote_day   = cfg.remote_backup_base + "/" + date;
+    const std::string remote_day   = M.remote_backup_base + "/" + date;
     const std::string remote_tar   = remote_day + "/site_" + date + ".tar.gz";
     const std::string remote_sql   = remote_day + "/db_"   + date + ".sql";
 
@@ -705,7 +569,7 @@ static int run_once(const Config& cfg) {
 
     // Передача (с учётом --skip-upload)
     bool need_upload_tar = true, need_upload_sql = true;
-    if (cfg.skip_upload) {
+    if (skip_upload) {
         bool has_tar = remote_file_nonzero(remote_tar);
         bool has_sql = remote_file_nonzero(remote_sql);
         if (has_tar && has_sql) {
@@ -746,30 +610,35 @@ static int run_once(const Config& cfg) {
     }
 
     // Развёртывание
-    std::cout << "🧩 Развёртывание на удалённом хосте (" << cfg.target_server << ")...\n";
-    std::string deploy_cmd = (cfg.target_server == "nginx")
-                           ? build_nginx_deploy_cmd(cfg, remote_tar, remote_sql, remote_day)
-                           : build_apache_deploy_cmd(cfg, remote_tar, remote_sql, remote_day);
-    if (ssh_exec(session, deploy_cmd, true) != 0)
-        std::cerr << "⚠️  Развёртывание завершилось с ошибкой. Проверь вывод выше.\n";
+    std::cout << "🧩 Развёртывание на удалённом хосте (" << M.target_server << ")...\n";
+    std::string deploy_cmd = (M.target_server == "nginx")
+                           ? build_nginx_deploy_cmd(S, M, remote_tar, remote_sql, remote_day)
+                           : build_apache_deploy_cmd(S, M, remote_tar, remote_sql, remote_day);
+    int deploy_rc = ssh_exec(session, deploy_cmd, true);
+    if (deploy_rc != 0)
+        std::cerr << "⚠️  Развёртывание завершилось с ошибкой (код " << deploy_rc << "). Проверь вывод выше.\n";
 
     // Завершение
     sftp_free(sftp);
     ssh_disconnect(session);
     ssh_free(session);
 
-    std::cout << "\n🎉 Бэкап и передача завершены.\n";
+    std::error_code ec;
+    fs::remove_all(tmp_dir, ec);
+    std::cout << "🧹 Временные файлы удалены: " << tmp_dir << "\n";
+    if (deploy_rc == 0) {
+        std::cout << "\n🎉 Бэкап и передача завершены.\n";
+    }
     std::cout << "ℹ️ Файлы на удалёнке: " << remote_day << "\n";
-    return 0;
+    return deploy_rc;
 }
 
 // --------------------------- MAIN ---------------------------
-int main(int argc, char** argv) {
+int main(int argc, char** argv,
+         const std::string& site_sel   = "", // "" — первый сайт
+         const std::string& mirror_sel = "") // "" — все зеркала сайта
+{
     std::cout << "🔧 madbackuper: SCP/SFTP бэкап и развертывание\n";
-
-    // Флаги демона
-    bool daemon_mode = false;
-    int  alarm_h = 3, alarm_m = 0; // по умолчанию 03:00
 
     // Конфиг: создать при первом запуске
     std::string cfg_path = CFG_PATH_PRIMARY;
@@ -790,7 +659,7 @@ int main(int argc, char** argv) {
     // Загрузка конфига + CLI
     Config cfg;
     load_kv_file(cfg_path, cfg);
-    apply_cli_kv(argc, argv, cfg, daemon_mode, alarm_h, alarm_m);
+    apply_cli_kv(argc, argv, cfg);
 
     // Валидация
     std::string verr; if (!validate(cfg, verr)) { std::cerr << "❌ Ошибка параметров: " << verr << "\n"; return 1; }
@@ -799,36 +668,45 @@ int main(int argc, char** argv) {
     std::signal(SIGINT,  on_sigint);
     std::signal(SIGTERM, on_sigterm);
 
-    // Режим демона
-    if (daemon_mode) {
-        std::cout << "🕒 Демон-режим: запуск в "
-                  << (alarm_h<10?"0":"") << alarm_h << ":" << (alarm_m<10?"0":"") << alarm_m
-                  << " по локальному времени сервера.\n";
-        while (!g_stop) {
-            std::time_t t = next_local_time(alarm_h, alarm_m);
-            char buf[32]; std::tm lt{}; localtime_r(&t, &lt);
-            std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %Z", &lt);
-            std::cout << "⏳ Жду до: " << buf << std::endl;
-
-            sleep_until_epoch(t);
-            if (g_stop) break;
-
-            try {
-                if (run_once(cfg) != 0)
-                    std::cerr << "⚠️ run_once завершился с ошибкой\n";
-            } catch (const std::exception& e) {
-                std::cerr << "❌ Исключение в run_once: " << e.what() << "\n";
-            } catch (...) {
-                std::cerr << "❌ Неизвестная ошибка в run_once\n";
-            }
-
-            // Защита от «двойного» выстрела в ту же минуту
-            for (int i=0; i<60 && !g_stop; ++i) std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-        std::cout << "👋 Демон аккуратно остановлен.\n";
-        return 0;
+    // Выбор сайта
+    const Site* S = nullptr;
+    if (site_sel.empty()) {
+        if (cfg.sites.empty()) { std::cerr << "❌ В конфиге нет сайтов.\n"; return 1; }
+        S = &cfg.sites.front();
+        std::cout << "🌍 Сайт: " << S->name << " (по умолчанию)\n";
+    } else {
+        for (const auto& s : cfg.sites) if (s.name == site_sel) { S = &s; break; }
+        if (!S) { std::cerr << "❌ Сайт не найден: " << site_sel << "\n"; return 1; }
+        std::cout << "🌍 Сайт: " << S->name << "\n";
     }
 
-    // Обычный «один раз и вышел»
-    return run_once(cfg);
+    // Выбор зеркал
+    if (!mirror_sel.empty()) {
+        bool found = false;
+        for (const auto& s : cfg.sites)
+            for (const auto& mname : s.mirrors)
+                if (mname == mirror_sel) { found = true; break; }
+        if (!found) { std::cerr << "❌ Зеркало не найдено: " << mirror_sel << "\n"; return 1; }
+        bool in_site = false;
+        for (const auto& mname : S->mirrors) if (mname == mirror_sel) { in_site = true; break; }
+        if (!in_site) {
+            std::cerr << "❌ Зеркало «" << mirror_sel << "» не привязано к сайту «" << S->name << "»\n";
+            return 1;
+        }
+    }
+
+    int overall_rc = 0;
+    bool any = false;
+    for (const std::string& mname : S->mirrors) {
+        if (!mirror_sel.empty() && mname != mirror_sel) continue;
+        const Mirror* M = nullptr;
+        for (const auto& m : cfg.mirrors) if (m.name == mname) { M = &m; break; }
+        if (!M) { std::cerr << "❌ Зеркало «" << mname << "» не найдено в [mirrors].\n"; overall_rc = 1; continue; }
+        any = true;
+        std::cout << "\n📦 Зеркало " << M->name << " (" << M->remote_host << ")...\n";
+        int rc = run_once(*S, *M, cfg.skip_tar, cfg.skip_sql, cfg.skip_upload);
+        if (rc != 0 && overall_rc == 0) overall_rc = rc;
+    }
+    if (!any) { std::cerr << "❌ Нет зеркал для обработки.\n"; return 1; }
+    return overall_rc;
 }
