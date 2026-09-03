@@ -1,11 +1,13 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 #include "mad/backup.hpp"
 #include "mad/core.hpp"
 #include "mad/daemon.hpp"
+#include "mad/ui.hpp"
 
 namespace fs = std::filesystem;
 
@@ -15,6 +17,7 @@ enum class Action {
     Backup,
     BackupDaemon,
     Monitor,
+    Ui,
     Install,
     Uninstall,
     Help
@@ -27,7 +30,8 @@ Action parse_action(int argc, char** argv) {
         if (arg == "--daemon-install" || arg == "install") return Action::Install;
         if (arg == "--daemon-uninstall" || arg == "uninstall") return Action::Uninstall;
         if (arg == "--monitor" || arg == "monitor") return Action::Monitor;
-        if (arg == "--daemon") return Action::BackupDaemon; // совместимость со старой семантикой
+        if (arg == "ui" || arg == "--ui" || arg == "madui") return Action::Ui;
+        if (arg == "--daemon") return Action::BackupDaemon;
         if (arg == "backup") return Action::Backup;
     }
     return Action::Backup;
@@ -42,6 +46,26 @@ std::string explicit_config_path(int argc, char** argv) {
     return {};
 }
 
+mad::UiOptions ui_options(int argc, char** argv) {
+    mad::UiOptions options;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg.rfind("--ui-bind=", 0) == 0) {
+            options.bind = arg.substr(std::string("--ui-bind=").size());
+        } else if (arg.rfind("--ui-port=", 0) == 0) {
+            const std::string value = arg.substr(std::string("--ui-port=").size());
+            try {
+                std::size_t used = 0;
+                options.port = std::stoi(value, &used);
+                if (used != value.size()) throw std::invalid_argument("tail");
+            } catch (...) {
+                throw std::runtime_error("Некорректный --ui-port=" + value);
+            }
+        }
+    }
+    return options;
+}
+
 std::string user_config_path() {
     const char* home = std::getenv("HOME");
     if (home && *home) return (fs::path(home) / ".config" / "madbackuper.conf").string();
@@ -49,14 +73,22 @@ std::string user_config_path() {
 }
 
 void print_help() {
-    std::cout << R"(madWebMirrorMagick / madbackuper
+    std::cout << R"(madWebMirrorMagick
 
 Использование:
   madbackuper backup                 Один бэкап + развёртывание (по умолчанию)
-  madbackuper --daemon               Старый daemon-режим: запуск backup по schedule_hhmm
-  madbackuper monitor                Локальный health monitor/failover
+  madbackuper --daemon               Плановый backup по schedule_hhmm
+  madbackuper monitor                Health monitor / failover
+  sudo madbackuper ui                Интерактивная панель madUI
   madbackuper install                Установить systemd backup timer + remote watchdog
   madbackuper uninstall              Удалить сервисы
+
+madUI:
+  sudo madbackuper ui --ui-bind=0.0.0.0 --ui-port=8790
+
+  После открытия URL браузер показывает одноразовый код. Новый browser-session
+  получает доступ только после подтверждения [y/N] в том же sudo-терминале.
+  Sudo/root пароль приложение не получает и не сохраняет.
 
 Общие параметры:
   --config=/path/to/file
@@ -92,9 +124,11 @@ int main(int argc, char** argv) {
             std::cerr << "❌ " << e.what() << '\n';
             return 1;
         }
-        std::cout << "✅ Создан конфиг: " << cfg_path
-                  << "\nОтредактируйте его и запустите программу снова.\n";
-        return 0;
+        std::cout << "✅ Создан конфиг: " << cfg_path << '\n';
+        if (action != Action::Ui) {
+            std::cout << "Запустите sudo madbackuper ui и завершите настройку через madUI.\n";
+            return 0;
+        }
     }
 
     mad::Config cfg;
@@ -106,9 +140,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // madUI должен уметь стартовать даже с ещё не законченной конфигурацией:
+    // именно через него пользователь исправляет параметры первого запуска.
+    if (action == Action::Ui) {
+        try {
+            return mad::run_ui(cfg, cfg_path, ui_options(argc, argv));
+        } catch (const std::exception& e) {
+            std::cerr << "❌ madUI: " << e.what() << '\n';
+            return 1;
+        }
+    }
+
     std::string validation_error;
     if (!mad::validate(cfg, validation_error)) {
-        std::cerr << "❌ Ошибка параметров: " << validation_error << '\n';
+        std::cerr << "❌ Ошибка параметров: " << validation_error
+                  << "\nЗапустите sudo madbackuper ui для настройки.\n";
         return 1;
     }
 
@@ -118,6 +164,7 @@ int main(int argc, char** argv) {
         case Action::Monitor:      return mad::run_monitor_loop(cfg);
         case Action::Install:      return mad::daemon_install(cfg);
         case Action::Uninstall:    return mad::daemon_uninstall(cfg);
+        case Action::Ui:
         case Action::Help:         break;
     }
     return 1;
