@@ -60,7 +60,19 @@ echo "📁 Готовлю системные каталоги…"
 $SUDO install -d -m 0755 "$PREFIX/bin" "$PREFIX/libexec"
 $SUDO install -d -m 0750 -o root -g "$SERVICE_GROUP_NAME" /etc/madwebmirror /srv/madwebmirror /srv/madwebmirror/sites
 $SUDO install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP_NAME" /var/lib/madwebmirror /var/lib/madwebmirror/sites
-$SUDO install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP_NAME" /var/lib/madwebmirror/ssh
+$SUDO install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP_NAME" /var/lib/madwebmirror/ssh /var/lib/madwebmirror/.ssh
+
+# A sudo-launched madUI should use one canonical system config instead of
+# accidentally creating /root/.config/madbackuper.conf.
+if [[ ! -e /etc/madbackuper.conf ]]; then
+  CONFIG_TMP="$(mktemp)"
+  cat >"$CONFIG_TMP" <<'EOF'
+# madWebMirrorMagick system configuration
+# Complete setup in madUI. File is root:madbackup 0640.
+EOF
+  $SUDO install -o root -g "$SERVICE_GROUP_NAME" -m 0640 "$CONFIG_TMP" /etc/madbackuper.conf
+  rm -f "$CONFIG_TMP"
+fi
 
 if [[ ! -e /etc/madwebmirror/tunnels.conf ]]; then
   TUNNELS_TMP="$(mktemp)"
@@ -90,15 +102,47 @@ $SUDO install -o root -g root -m 0440 "$SUDOERS_TMP" /etc/sudoers.d/madwebmirror
 rm -f "$SUDOERS_TMP"
 trap - EXIT
 
+TUNNEL_UNIT_TMP="$(mktemp)"
+cat >"$TUNNEL_UNIT_TMP" <<EOF
+[Unit]
+Description=madWebMirrorMagick dual-proxy SSH tunnel supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_GROUP_NAME
+ExecStart=$BIN_DST tunnels --config=/etc/madbackuper.conf --tunnels=/etc/madwebmirror/tunnels.conf
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+$SUDO install -o root -g root -m 0644 "$TUNNEL_UNIT_TMP" /etc/systemd/system/madwebmirror-tunnels.service
+rm -f "$TUNNEL_UNIT_TMP"
+$SUDO systemctl daemon-reload
+
 echo
 echo "✅ Runtime privilege model установлен:"
 echo "   • $SERVICE_USER не имеет shell-login;"
 echo "   • sudo/root пароль программе не нужен;"
 echo "   • privileged операции доступны только через $HELPER_DST;"
 echo "   • web-копии создаются под /srv/madwebmirror/sites/<site-id>;"
-echo "   • SSH keys хранятся в /var/lib/madwebmirror/ssh с правами service account;"
-echo "   • tunnel policy хранится в /etc/madwebmirror/tunnels.conf;"
-echo "   • OpenSSH client доступен для jump/bastion transport через Proxy A/Proxy B."
+echo "   • SSH keys хранятся в /var/lib/madwebmirror/ssh;"
+echo "   • SSH trust store: /var/lib/madwebmirror/.ssh/known_hosts;"
+echo "   • tunnel policy: /etc/madwebmirror/tunnels.conf;"
+echo "   • madwebmirror-tunnels.service установлен, но включается после настройки tunnel policy."
 echo
 echo "✨ Сейчас будет запущен madUI."
 echo "   Откройте напечатанный ниже адрес в браузере."
