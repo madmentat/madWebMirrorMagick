@@ -1,151 +1,114 @@
-#include <string>
-#include <sstream>
 #include "mad/deploy.hpp"
-#include "mad/core.hpp"
-#include "mad/net.hpp"
+
+#include <cctype>
+#include <sstream>
 
 namespace mad {
+namespace {
 
-// экранирование двойных кавычек в sh-строке
-static inline std::string dq(const std::string& s) {
-    std::string r; r.reserve(s.size()+8);
-    for (char c: s) { if (c=='"') r += "\\\""; else r += c; }
-    return r;
+bool safe_site_id(const std::string& value) {
+    if (value.empty()) return false;
+    for (const unsigned char c : value) {
+        if (!std::isalnum(c) && c != '.' && c != '-' && c != '_') return false;
+    }
+    return true;
 }
 
-// --- DEPLOY NGINX ------------------------------------------------------------
-// Замечание: добавлен ключ --warning=no-timestamp к tar, чтобы подавить
-// «временная метка ... в будущем».
-std::string build_nginx_deploy_cmd(const Config& C,
+std::string build_common_deploy_cmd(const Config& cfg,
+                                    const std::string& remote_tar,
+                                    const std::string& remote_sql,
+                                    const std::string& remote_db_cnf,
+                                    const std::string& remote_day,
+                                    const char* server_kind) {
+    const std::string webroot = cfg.remote_site_dir;
+    const std::string staging = webroot + ".new";
+    const std::string old = webroot + ".old";
+
+    std::ostringstream sh;
+    sh << "set -Eeuo pipefail; umask 077; "
+       << "WEBROOT=" << shell_quote(webroot) << "; "
+       << "STAGING=" << shell_quote(staging) << "; "
+       << "OLD=" << shell_quote(old) << "; "
+       << "REMOTE_TAR=" << shell_quote(remote_tar) << "; "
+       << "REMOTE_SQL=" << shell_quote(remote_sql) << "; "
+       << "DB_CNF=" << shell_quote(remote_db_cnf) << "; "
+       << "REMOTE_DAY=" << shell_quote(remote_day) << "; "
+       << "DB_NAME=" << shell_quote(cfg.db_name) << "; "
+       << "trap 'rm -f -- \"$DB_CNF\"; rm -rf -- \"$STAGING\"' EXIT; "
+       << "command -v tar >/dev/null || { echo 'tar not found' >&2; exit 20; }; "
+       << "command -v mysql >/dev/null || { echo 'mysql client not found' >&2; exit 21; }; "
+       << "command -v mysqldump >/dev/null || { echo 'mysqldump not found' >&2; exit 22; }; "
+       << "test -s \"$REMOTE_TAR\" || { echo 'site archive is empty' >&2; exit 23; }; "
+       << "test -s \"$DB_CNF\" || { echo 'database credentials file is missing' >&2; exit 24; }; "
+       << "echo '📦 Готовлю staging-каталог (" << server_kind << ")' >&2; "
+       << "rm -rf -- \"$STAGING\"; mkdir -p -- \"$STAGING\"; "
+       << "tar --warning=no-timestamp -xzf \"$REMOTE_TAR\" -C \"$STAGING\"; "
+       << "find \"$STAGING\" -type d -exec chmod 755 {} +; "
+       << "find \"$STAGING\" -type f -exec chmod 644 {} +; "
+       << "echo '📦 Сохраняю текущую БД' >&2; "
+       << "mysqldump --defaults-extra-file=\"$DB_CNF\" --single-transaction --quick --routines --triggers --events --no-tablespaces "
+       << "\"$DB_NAME\" > \"$REMOTE_DAY/db_old.sql\"; chmod 600 \"$REMOTE_DAY/db_old.sql\"; "
+       << "echo '🔁 Переключаю webroot' >&2; "
+       << "rm -rf -- \"$OLD\"; "
+       << "if [ -e \"$WEBROOT\" ]; then mv -- \"$WEBROOT\" \"$OLD\"; fi; "
+       << "mv -- \"$STAGING\" \"$WEBROOT\"; "
+       << "if [ -s \"$REMOTE_SQL\" ]; then "
+       << "  echo '🗄️ Импортирую БД' >&2; "
+       << "  if ! mysql --defaults-extra-file=\"$DB_CNF\" \"$DB_NAME\" < \"$REMOTE_SQL\"; then "
+       << "    echo '❌ Импорт БД не удался — возвращаю прежний webroot' >&2; "
+       << "    rm -rf -- \"$WEBROOT\"; if [ -e \"$OLD\" ]; then mv -- \"$OLD\" \"$WEBROOT\"; fi; exit 30; "
+       << "  fi; "
+       << "fi; "
+       << "trap - EXIT; rm -f -- \"$DB_CNF\"; "
+       << "echo '✅ Развёртывание завершено' >&2;";
+    return sh.str();
+}
+
+} // namespace
+
+std::string build_nginx_deploy_cmd(const Config& cfg,
                                    const std::string& remote_tar,
                                    const std::string& remote_sql,
-                                   const std::string& remote_day)
-{
-    std::ostringstream sh;
-
-    sh
-    << "set -e; SUDO=\"\"; "
-    << "if [ \"$(id -u)\" -ne 0 ]; then "
-    << "  if command -v sudo >/dev/null 2>&1; then SUDO=\"sudo\"; else echo 'sudo not found' 1>&2; exit 1; fi; "
-    << "fi; "
-    << "echo '🔧 Проверяю окружение (nginx/mysql/tar)' 1>&2; "
-    << "command -v nginx >/dev/null || { echo 'nginx not found' 1>&2; exit 1; }; "
-    << "command -v tar   >/dev/null || { echo 'tar not found' 1>&2; exit 1; }; "
-    << "WEBROOT=\"" << dq(C.remote_site_dir) << "\"; "
-    << "REMOTE_TAR=\"" << dq(remote_tar) << "\"; "
-    << "REMOTE_SQL=\"" << dq(remote_sql) << "\"; "
-    << "REMOTE_DAY=\"" << dq(remote_day) << "\"; "
-
-    // директории
-    << "echo '📦 Подготавливаю директории сайта' 1>&2; "
-    << "$SUDO mkdir -p \"$WEBROOT\"; "
-    << "$SUDO rm -rf \"$WEBROOT.old\"; "
-    << "$SUDO mv \"$WEBROOT\" \"$WEBROOT.old\" 2>/dev/null || true; "
-    << "$SUDO mkdir -p \"$WEBROOT\"; "
-
-    // распаковка (с подавлением предупреждений)
-    << "echo '📤 Распаковка архива сайта' 1>&2; "
-    << "if command -v pv >/dev/null 2>&1; then "
-    << "  pv -f -p -t -e -r -b \"$REMOTE_TAR\" | tar --warning=no-timestamp -xzf - -C \"$WEBROOT\"; "
-    << "else "
-    << "  tar --warning=no-timestamp -xzf \"$REMOTE_TAR\" -C \"$WEBROOT\" --checkpoint=500 --checkpoint-action=echo=. ; echo; "
-    << "fi; "
-
-    // права
-    << "echo '🧰 Выставляю права' 1>&2; "
-    << "$SUDO chown -R www-data:www-data \"$WEBROOT\" || true; "
-    << "find \"$WEBROOT\" -type d -exec $SUDO chmod 755 {} \\; || true; "
-    << "find \"$WEBROOT\" -type f -exec $SUDO chmod 644 {} \\; || true; "
-
-    // БД
-    << "echo '🗄️  Подготавливаю БД и пользователя (MariaDB)' 1>&2; "
-    << "SQL=\""
-       "CREATE DATABASE IF NOT EXISTS \\\"" << dq(C.db_name) << "\\\" "
-       "DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; "
-       "CREATE USER IF NOT EXISTS '" << C.db_user << "'@'localhost' IDENTIFIED BY '" << C.db_pass << "'; "
-       "CREATE USER IF NOT EXISTS '" << C.db_user << "'@'127.0.0.1' IDENTIFIED BY '" << C.db_pass << "'; "
-       "GRANT ALL ON \\\"" << dq(C.db_name) << "\\\".* TO '" << C.db_user << "'@'localhost', '" << C.db_user << "'@'127.0.0.1';"
-    << "\"; "
-    << "$SUDO sh -lc \"echo \\\"$SQL\\\" | mysql\"; "
-
-    << "echo '📦 Бэкап прежней БД (мягко)' 1>&2; "
-    << "$SUDO sh -lc \"/usr/bin/mysqldump " << C.db_name
-       << " > \\\"$REMOTE_DAY/db_old.sql\\\" 2>/dev/null || true\"; "
-
-    << "if [ -s \"$REMOTE_SQL\" ]; then "
-    << "  echo '⬇️  Импортирую дамп' 1>&2; "
-    << "  $SUDO sh -lc \"/usr/bin/mysql " << C.db_name << " < \\\"$REMOTE_SQL\\\"\"; "
-    << "fi; "
-
-    // nginx конфиги/переключатель (не меняем здесь — ниже отдельные команды switch_*)
-    << "echo '🔀 Проверка конфигурации nginx' 1>&2; "
-    << "$SUDO nginx -t; "
-    << "$SUDO systemctl reload nginx || $SUDO nginx -s reload; "
-
-    // счетчик таблиц чисто информативно
-    << "CNT=$($SUDO sh -lc \"mysql -N -B -e 'SELECT COUNT(*) FROM information_schema.tables "
-       "WHERE table_schema=\\\"" << dq(C.db_name) << "\\\";'\" 2>/dev/null || echo 0); "
-    << "echo '   📊 Таблиц в БД после импорта: '\"$CNT\" 1>&2; "
-
-    << "exit 0;";
-
-    return sh.str();
+                                   const std::string& remote_db_cnf,
+                                   const std::string& remote_day) {
+    return build_common_deploy_cmd(cfg, remote_tar, remote_sql, remote_db_cnf, remote_day, "nginx");
 }
 
-// --- DEPLOY APACHE (пока без изменений) -------------------------------------
-std::string build_apache_deploy_cmd(const Config& C,
-                                    const std::string& remote_tar
-                                    //const std::string& remote_sql,
-                                    //const std::string& remote_day
-					)
-{
-    // пока просто распаковка
-    std::ostringstream sh;
-    sh
-    << "set -e; SUDO=\"\"; "
-    << "if [ \"$(id -u)\" -ne 0 ]; then "
-    << "  if command -v sudo >/dev/null 2>&1; then SUDO=\"sudo\"; else echo 'sudo not found' 1>&2; exit 1; fi; "
-    << "fi; "
-    << "WEBROOT=\"" << dq(C.remote_site_dir) << "\"; "
-    << "REMOTE_TAR=\"" << dq(remote_tar) << "\"; "
-    << "echo '📤 Распаковка архива сайта (apache)' 1>&2; "
-    << "$SUDO mkdir -p \"$WEBROOT\"; "
-    << "if command -v pv >/dev/null 2>&1; then "
-    << "  pv -f -p -t -e -r -b \"$REMOTE_TAR\" | tar --warning=no-timestamp -xzf - -C \"$WEBROOT\"; "
-    << "else "
-    << "  tar --warning=no-timestamp -xzf \"$REMOTE_TAR\" -C \"$WEBROOT\" --checkpoint=500 --checkpoint-action=echo=. ; echo; "
-    << "fi; "
-    << "$SUDO chown -R www-data:www-data \"$WEBROOT\" || true; "
-    << "find \"$WEBROOT\" -type d -exec $SUDO chmod 755 {} \\; || true; "
-    << "find \"$WEBROOT\" -type f -exec $SUDO chmod 644 {} \\; || true; "
-    << "exit 0;";
-    return sh.str();
+std::string build_apache_deploy_cmd(const Config& cfg,
+                                    const std::string& remote_tar,
+                                    const std::string& remote_sql,
+                                    const std::string& remote_db_cnf,
+                                    const std::string& remote_day) {
+    return build_common_deploy_cmd(cfg, remote_tar, remote_sql, remote_db_cnf, remote_day, "apache2");
 }
 
+std::string resolved_switch_script(const Config& cfg) {
+    if (!cfg.switch_script.empty()) return cfg.switch_script;
+    std::string id = cfg.server_name;
+    const auto dot = id.find('.');
+    if (dot != std::string::npos) id.resize(dot);
+    if (!safe_site_id(id)) return {};
+    return "/root/setup_" + id + "_nginx.sh";
+}
 
-// --- SWITCH: nginx -> remote -------------------------------------------------
-// Возвращаем бекенд на REMOTE (C.proxy_target:80/443 — в твоём сетапе 198).
-std::string build_nginx_switch_to_remote_cmd(const Config& C)
-{
-    std::ostringstream sh;
-    sh
-    << "set -e; SUDO=\"\"; "
-    << "if [ \"$(id -u)\" -ne 0 ]; then "
-    << "  if command -v sudo >/dev/null 2>&1; then SUDO=\"sudo\"; else echo 'sudo not found' 1>&2; exit 1; fi; "
-    << "fi; "
-    << "CONF=\"/etc/nginx/conf.d/" << dq(C.server_name) << ".backend.conf\"; "
-    << "echo '🔁 Переключаю nginx BACKEND → remote (" << dq(C.proxy_target) << ")' 1>&2; "
-    << "cat > /tmp/_backend.conf <<EOF\n"
-       "upstream " << C.server_name << "_backend {\n"
-       "    server " << C.proxy_target << ":80;\n"
-       "}\n"
-       "map $host $backend_scheme { default http; }\n"
-       "EOF\n"
-    << "$SUDO mv /tmp/_backend.conf \"$CONF\"; "
-    << "$SUDO nginx -t && $SUDO systemctl reload nginx || $SUDO nginx -s reload; "
-    << "echo '✅ BACKEND: remote' 1>&2; "
-    << "exit 0;";
-    return sh.str();
+static std::string build_switch_cmd(const Config& cfg, const char* mode) {
+    const std::string script = resolved_switch_script(cfg);
+    if (script.empty()) return "echo 'invalid switch_script/server_name' >&2; exit 2";
+
+    // Никаких универсальных sudo-команд: разрешается только заранее установленный
+    // root-owned switch script и только два фиксированных аргумента local/remote.
+    if (cfg.remote_user == "root") {
+        return shell_quote(script) + " " + mode;
+    }
+    return "sudo -n -- " + shell_quote(script) + " " + mode;
+}
+
+std::string build_nginx_switch_to_local_cmd(const Config& cfg) {
+    return build_switch_cmd(cfg, "local");
+}
+
+std::string build_nginx_switch_to_remote_cmd(const Config& cfg) {
+    return build_switch_cmd(cfg, "remote");
 }
 
 } // namespace mad
