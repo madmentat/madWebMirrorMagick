@@ -1,94 +1,73 @@
 #pragma once
-#include <string>
+
 #include <cstdint>
 #include <filesystem>
-#include <chrono>
+#include <string>
 
 namespace mad {
+
 namespace fs = std::filesystem;
-using clock_ = std::chrono::steady_clock;
 
-
-
-struct Config; // реализация в core.cpp
-
-
-// utils
-std::string base64_encode(const std::string& in);
-std::string trim(const std::string& s);
-std::string today();
-std::string human_size(uint64_t bytes);
-uint64_t dir_size_bytes(const std::filesystem::path& root);
-bool has_command(const char* name);
-int  run_local(const std::string& cmd, bool echo = true);
-int  run_with_spinner(const std::string& cmd, const std::string& label);
-
-// config IO & validation
-extern const char* CFG_PATH_PRIMARY;
-extern const char* CFG_PATH_FALLBACK;
-extern const char* DEFAULT_TARGET;
-extern const int   DEFAULT_SSH_PORT;
-extern const int   DEFAULT_LOCAL_HTTP_PORT;
-extern const int   DEFAULT_LOCAL_HTTPS_PORT;
-extern const bool  DEFAULT_SWITCH_TO_LOCAL;
-extern const std::string DEFAULT_PHP_VERSION;
-extern const int   DEFAULT_HEALTH_INTERVAL_SEC; // NEW
+inline constexpr const char* CFG_PATH_PRIMARY = "/etc/madbackuper.conf";
+inline constexpr const char* CFG_PATH_FALLBACK = "/root/madbackuper.conf";
 
 struct Config {
-    // основные
-    std::string target_server; // "nginx" | "apache2"
+    std::string target_server{"nginx"};
     std::string remote_host;
-    int         ssh_port;
+    int ssh_port{22};
     std::string remote_user;
     std::string remote_pass;
     std::string remote_sudo_pass;
-    std::string remote_root_pass;
 
-    // пути
     std::string local_site_dir;
     std::string remote_site_dir;
     std::string remote_backup_base;
 
-
-    // веб
     std::string server_name;
+    std::string switch_script;
 
-    // PHP
-    std::string php_version;
+    std::string php_version{"8.3"};
     std::string php_fpm_sock;
 
-    // БД
     std::string db_user;
     std::string db_pass;
     std::string db_name;
 
-    // прокси/переключение
     std::string proxy_target;
-    int         local_http_port;
-    int         local_https_port;
-    bool        switch_to_local;
+    int local_http_port{8081};
+    int local_https_port{0};
+    bool switch_to_local{true};
 
-     // Health-check
-     std::string health_url;          // если пусто → берём http://127.0.0.1:<local_http_port>/
-     std::string health_host_header;  // если непусто → добавляем curl -H "Host: <...>"
+    std::string health_url;
+    std::string health_host_header;
+    int health_interval_sec{60};
+    int health_failures{3};
+    int health_recoveries{3};
+    int switch_cooldown_sec{60};
 
-    // SSL
     std::string ssl_cert;
     std::string ssl_key;
 
-    // флаги
-    bool        skip_tar{false};
-    bool        skip_sql{false};
-    bool        skip_upload{false};
+    bool skip_tar{false};
+    bool skip_sql{false};
+    bool skip_upload{false};
 
-    // демонизация/расписание
-    int         health_interval_sec = 60;    // период health-check, сек
-    std::string schedule_hhmm = "04:00";     // время ежедневного запуска
+    std::string schedule_hhmm{"04:00"};
 };
+
+std::string trim(const std::string& s);
+std::string today();
+std::string timestamp();
+std::string human_size(std::uint64_t bytes);
+std::uint64_t dir_size_bytes(const fs::path& root);
+bool has_command(const char* name);
+int run_local(const std::string& cmd, bool echo = true);
+std::string shell_quote(const std::string& value);
 
 void write_default_config(const std::string& path);
 void load_kv_file(const std::string& path, Config& cfg);
 void apply_cli_kv(int argc, char** argv, Config& cfg);
-bool validate(const Config& c, std::string& err);
+bool validate(const Config& cfg, std::string& err);
+bool parse_hhmm(const std::string& value, int& hh, int& mm);
 
 } // namespace mad
