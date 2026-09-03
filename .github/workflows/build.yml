@@ -1,0 +1,16 @@
+name: build
+
+on:
+  push:
+    branches: [develop, release, snapshot]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y g++ make libssh-dev
+      - name: Build
+        run: make -j2
