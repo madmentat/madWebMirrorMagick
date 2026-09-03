@@ -24,11 +24,10 @@
 namespace mad {
 namespace {
 
+constexpr const char* kKnownHosts = "/var/lib/madwebmirror/.ssh/known_hosts";
 std::atomic<bool> keep_running{true};
 
-void on_signal(int) {
-    keep_running = false;
-}
+void on_signal(int) { keep_running = false; }
 
 struct Endpoint {
     std::string user;
@@ -132,9 +131,7 @@ bool parse_int(const std::string& s, int& out) {
         std::size_t used = 0;
         out = std::stoi(s, &used);
         return used == s.size();
-    } catch (...) {
-        return false;
-    }
+    } catch (...) { return false; }
 }
 
 bool parse_bool(const std::string& s) {
@@ -157,11 +154,23 @@ std::string route_key(const Config& cfg, const std::string& route) {
     return {};
 }
 
-void chown_to_service_user(const std::filesystem::path& path) {
-    if (::geteuid() != 0) return;
-    passwd* pw = ::getpwnam("madbackup");
-    if (!pw) return;
-    ::chown(path.c_str(), pw->pw_uid, pw->pw_gid);
+bool set_policy_permissions(const std::filesystem::path& path, std::string& err) {
+    if (::chmod(path.c_str(), 0640) != 0) {
+        err = "Не удалось chmod 0640 для " + path.string();
+        return false;
+    }
+    if (::geteuid() == 0) {
+        passwd* pw = ::getpwnam("madbackup");
+        if (!pw) {
+            err = "Не найден service user madbackup";
+            return false;
+        }
+        if (::chown(path.c_str(), 0, pw->pw_gid) != 0) {
+            err = "Не удалось установить root:madbackup для " + path.string();
+            return false;
+        }
+    }
+    return true;
 }
 
 std::string forward_arg(const ManagedTunnel& t) {
@@ -186,6 +195,7 @@ pid_t spawn_tunnel(const Config& cfg, const ManagedTunnel& tunnel, std::string& 
         "ssh", "-N", "-T",
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=yes",
+        "-o", std::string("UserKnownHostsFile=") + kKnownHosts,
         "-o", "ExitOnForwardFailure=yes",
         "-o", "ConnectTimeout=10",
         "-o", "ServerAliveInterval=15",
@@ -323,22 +333,21 @@ bool save_tunnels(const std::string& path, const std::vector<ManagedTunnel>& tun
         return false;
     }
     out.close();
-    ::chmod(tmp.c_str(), 0640);
-    chown_to_service_user(tmp);
+    if (!set_policy_permissions(tmp, err)) {
+        std::filesystem::remove(tmp);
+        return false;
+    }
     std::filesystem::rename(tmp, path, ec);
     if (ec) {
         std::filesystem::remove(tmp);
         err = "Не удалось заменить tunnels config: " + ec.message();
         return false;
     }
-    ::chmod(path.c_str(), 0640);
-    chown_to_service_user(path);
-    return true;
+    return set_policy_permissions(path, err);
 }
 
 bool validate_tunnels(const Config& cfg, const std::vector<ManagedTunnel>& tunnels, std::string& err) {
     err.clear();
-    std::set<std::string> local_binds;
     std::map<std::string, std::set<std::string>> seen_routes;
 
     for (const auto& t : tunnels) {
@@ -365,12 +374,8 @@ bool validate_tunnels(const Config& cfg, const std::vector<ManagedTunnel>& tunne
             return false;
         }
 
-        // Alternative routes with the same id may intentionally bind the same
-        // local port. Different logical tunnel ids may not.
         if (t.spec.enabled && t.spec.direction == SshTunnelDirection::LocalForward) {
             const std::string bind = t.spec.bind_host + ':' + std::to_string(t.spec.bind_port);
-            const std::string key = t.id + "@" + bind;
-            (void)key;
             for (const auto& other : tunnels) {
                 if (&other == &t || !other.spec.enabled || other.id == t.id ||
                     other.spec.direction != SshTunnelDirection::LocalForward) continue;
@@ -379,7 +384,6 @@ bool validate_tunnels(const Config& cfg, const std::vector<ManagedTunnel>& tunne
                     return false;
                 }
             }
-            local_binds.insert(bind);
         }
     }
     return true;
