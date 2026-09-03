@@ -19,6 +19,16 @@ struct Config {
     std::string remote_pass;
     std::string remote_sudo_pass;
 
+    // SSH management transport. Two jump hosts represent alternative paths
+    // through the two proxy-capable ingress nodes.
+    // ssh_transport: direct | jump | auto (direct first, then jump routes).
+    std::string ssh_transport{"direct"};
+    std::string ssh_identity_file;
+    std::string ssh_jump_primary;
+    std::string ssh_jump_primary_identity_file;
+    std::string ssh_jump_fallback;
+    std::string ssh_jump_fallback_identity_file;
+
     std::string local_site_dir;
     std::string remote_site_dir;
     std::string remote_backup_base;
