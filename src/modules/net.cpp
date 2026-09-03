@@ -21,6 +21,7 @@ namespace mad {
 namespace {
 
 using steady_clock = std::chrono::steady_clock;
+constexpr const char* kKnownHosts = "/var/lib/madwebmirror/.ssh/known_hosts";
 
 void print_progress_line(const std::string& label, std::uint64_t sent,
                          std::uint64_t total, double mbps) {
@@ -50,7 +51,8 @@ bool verify_known_host(ssh_session session, std::string& err) {
             break;
         case SSH_KNOWN_HOSTS_NOT_FOUND:
         case SSH_KNOWN_HOSTS_UNKNOWN:
-            err = "SSH host key отсутствует в known_hosts. Сначала проверьте ключ сервера и добавьте его в known_hosts.";
+            err = std::string("SSH host key отсутствует в ") + kKnownHosts +
+                  ". Запустите SSH enrollment и подтвердите fingerprint сервера.";
             break;
         case SSH_KNOWN_HOSTS_ERROR:
         default:
@@ -176,6 +178,7 @@ bool build_proxy_command(const std::string& proxy_jump,
     cmd << "ssh"
         << " -o BatchMode=yes"
         << " -o StrictHostKeyChecking=yes"
+        << " -o UserKnownHostsFile=" << shell_quote(kKnownHosts)
         << " -o ConnectTimeout=10"
         << " -o ServerAliveInterval=15"
         << " -o ServerAliveCountMax=2";
@@ -205,6 +208,11 @@ ssh_session connect_one(const Config& cfg,
     ssh_options_set(session, SSH_OPTIONS_HOST, cfg.remote_host.c_str());
     ssh_options_set(session, SSH_OPTIONS_USER, cfg.remote_user.c_str());
     ssh_options_set(session, SSH_OPTIONS_PORT, &cfg.ssh_port);
+    if (ssh_options_set(session, SSH_OPTIONS_KNOWNHOSTS, kKnownHosts) != SSH_OK) {
+        err = std::string("Не удалось настроить SSH known_hosts: ") + ssh_get_error(session);
+        ssh_free(session);
+        return nullptr;
+    }
 
     if (!cfg.ssh_identity_file.empty()) {
         if (ssh_options_set(session, SSH_OPTIONS_IDENTITY, cfg.ssh_identity_file.c_str()) != SSH_OK) {
