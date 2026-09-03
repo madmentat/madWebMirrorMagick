@@ -1,354 +1,300 @@
-// src/modules/daemon.cpp
+#include "mad/daemon.hpp"
+
+#include <libssh/sftp.h>
+#include <unistd.h>
+
 #include <chrono>
-#include <thread>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <sstream>
-#include <fstream>
+#include <thread>
 #include <vector>
 
-#include <unistd.h>     // readlink
-#include <limits.h>
-
-#include "mad/daemon.hpp"
-#include "mad/core.hpp"
+#include "mad/deploy.hpp"
 #include "mad/net.hpp"
 
-using namespace std::chrono_literals;
-
 namespace mad {
+namespace {
 
-// Короткий алиас на shell-эскейп одинарными кавычками
-static inline std::string esc_s(const std::string& s) { return sh_escape_single(s); }
-
-// ─────────────────────────── Health-check локального фронта ──────────────────
-bool check_local_site_ok(const Config& cfg) {
-    const std::string url = cfg.health_url.empty()
-        ? ("http://127.0.0.1:" + std::to_string(cfg.local_http_port) + "/")
-        : cfg.health_url;
-
-    std::ostringstream cmd;
-    cmd << "curl -fsSL -m 5 ";
-    if (!cfg.health_host_header.empty())
-        cmd << "-H 'Host: " << cfg.health_host_header << "' ";
-    cmd << esc_s(url) << " >/dev/null 2>&1";
-    return std::system(cmd.str().c_str()) == 0;
-}
-
-// ─────────────────────────── Одноразовый удалённый exec ──────────────────────
-static int ssh_exec_one(const Config& cfg, const std::string& command, bool print_out = true) {
-    ssh_session s = ssh_new();
-    if (!s) { std::cerr << "❌ ssh_new()\n"; return -1; }
-
-    ssh_options_set(s, SSH_OPTIONS_HOST, cfg.remote_host.c_str());
-    ssh_options_set(s, SSH_OPTIONS_USER, cfg.remote_user.c_str());
-    ssh_options_set(s, SSH_OPTIONS_PORT, &cfg.ssh_port);
-
-    if (ssh_connect(s) != SSH_OK) {
-        std::cerr << "❌ ssh_connect: " << ssh_get_error(s) << "\n";
-        ssh_free(s);
-        return -1;
-    }
-    if (ssh_userauth_password(s, nullptr, cfg.remote_pass.c_str()) != SSH_AUTH_SUCCESS) {
-        std::cerr << "❌ ssh auth failed: " << ssh_get_error(s) << "\n";
-        ssh_disconnect(s);
-        ssh_free(s);
-        return -1;
-    }
-
-    int rc = ssh_exec(s, command, print_out);
-    ssh_disconnect(s);
-    ssh_free(s);
-    return rc;
-}
-
-// ─────────────────────── Переключение nginx на 202 (remote) ──────────────────
-int remote_switch_to_local_nginx(const Config& cfg) {
-    std::ostringstream cmd;
-    cmd << "sh -lc '"
-        << "F=/root/setup_" << esc_s(cfg.server_name) << "_nginx.sh; "
-        << "if [ -x \"$F\" ]; then \"$F\" local; else echo \"(no setup script)\" >&2; fi"
-        << "'";
-    return ssh_exec_one(cfg, cmd.str(), /*print_out=*/true);
-}
-
-int remote_switch_to_remote_nginx(const Config& cfg) {
-    std::ostringstream cmd;
-    cmd << "sh -lc '"
-        << "F=/root/setup_" << esc_s(cfg.server_name) << "_nginx.sh; "
-        << "if [ -x \"$F\" ]; then \"$F\" remote; else echo \"(no setup script)\" >&2; fi"
-        << "'";
-    return ssh_exec_one(cfg, cmd.str(), /*print_out=*/true);
-}
-
-int ensure_watchdog_units(const Config& /*cfg*/) {
-    // TODO: позже можно добавить периодическую верификацию юнитов
-    return 0;
-}
-
-// ───────────────────────────── Демон-цикл на 198 ─────────────────────────────
-int run_daemon_loop(const Config& cfg) {
-    std::cout << "🌀 Демон запущен: health-check и переключение фронта (nginx)\n";
-
-    bool in_local_mode = false;
-    const int health_interval_sec = cfg.health_interval_sec > 0 ? cfg.health_interval_sec : 60;
-
-    // Первый прогон
-    {
-        const bool ok = check_local_site_ok(cfg);
-        if (!ok && cfg.target_server == "nginx") {
-            std::cout << "⚠️  Локальный сайт не отвечает — переключаю фронт на local (202)\n";
-            if (remote_switch_to_local_nginx(cfg) == 0) in_local_mode = true;
-        }
-    }
-
-    while (true) {
-        const bool ok = check_local_site_ok(cfg);
-
-        if (!ok && !in_local_mode && cfg.target_server == "nginx") {
-            std::cout << "⚠️  Локальный сайт упал — переключаю фронт на local (202)\n";
-            if (remote_switch_to_local_nginx(cfg) == 0) in_local_mode = true;
-        } else if (ok && in_local_mode && cfg.target_server == "nginx") {
-            std::cout << "✅ Локальный сайт ожил — возвращаю фронт на remote (202)\n";
-            if (remote_switch_to_remote_nginx(cfg) == 0) in_local_mode = false;
-        }
-
-        std::this_thread::sleep_for(std::chrono::seconds(health_interval_sec));
-    }
-    // недостижимо
-    // return 0;
-}
-
-// ────────────────────────── Вспомогалки для инсталляции ──────────────────────
-static std::string readlink_self() {
+std::string readlink_self() {
     std::vector<char> buf(1024);
     while (true) {
-        ssize_t n = ::readlink("/proc/self/exe", buf.data(), buf.size() - 1);
+        const ssize_t n = ::readlink("/proc/self/exe", buf.data(), buf.size() - 1);
         if (n < 0) return {};
-        if (static_cast<size_t>(n) < buf.size() - 1) {
-            buf[n] = '\0';
+        if (static_cast<std::size_t>(n) < buf.size() - 1) {
+            buf[static_cast<std::size_t>(n)] = '\0';
             return std::string(buf.data());
         }
         buf.resize(buf.size() * 2);
     }
 }
 
-static inline int run_local_cmd(const std::string& cmd) {
-    // используем реализацию из core.hpp (echo=true по умолчанию)
-    return ::mad::run_local(cmd, true);
+int ssh_exec_one(const Config& cfg, const std::string& command, bool print_out = true) {
+    std::string error;
+    ssh_session session = ssh_connect_authenticated(cfg, error);
+    if (!session) {
+        std::cerr << "❌ " << error << '\n';
+        return -1;
+    }
+    const int rc = ssh_exec(session, command, print_out);
+    ssh_disconnect_and_free(session);
+    return rc;
 }
 
-// ───────────────────────── Локальный systemd-юнит (198) ──────────────────────
-static int install_local_service(const std::string& exe_path) {
-    run_local_cmd("install -m 0755 " + esc_s(exe_path) + " /usr/local/bin/madbackuper");
+std::string sudo_shell_command(const Config& cfg, const std::string& inner) {
+    if (cfg.remote_user == "root") return "sh -lc " + shell_quote(inner);
+    if (cfg.remote_sudo_pass.empty()) {
+        return "sudo -n sh -lc " + shell_quote(inner);
+    }
+    return "printf %s " + shell_quote(cfg.remote_sudo_pass) +
+           " | sudo -S -p '' sh -lc " + shell_quote(inner);
+}
 
-    const char* unit_path = "/etc/systemd/system/madbackuper.service";
+int install_local_backup_timer(const Config& cfg, const std::string& exe_path) {
+    if (::geteuid() != 0) {
+        std::cerr << "❌ Установка systemd unit требует однократного запуска от root.\n";
+        return 1;
+    }
+
+    if (run_local("install -m 0755 " + shell_quote(exe_path) + " /usr/local/bin/madbackuper") != 0) return 1;
+
+    int hh = 0;
+    int mm = 0;
+    if (!parse_hhmm(cfg.schedule_hhmm, hh, mm)) return 1;
+
     {
-        std::ofstream u(unit_path);
-        u <<
-R"([Unit]
-Description=madbackuper daemon (health-check + backup scheduler)
+        std::ofstream service("/etc/systemd/system/madbackuper-backup.service", std::ios::trunc);
+        if (!service) return 1;
+        service << R"([Unit]
+Description=madWebMirrorMagick backup and deploy
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/madbackuper --daemon
-Restart=always
-RestartSec=5
+Type=oneshot
+ExecStart=/usr/local/bin/madbackuper backup
 User=root
-StandardOutput=journal
-StandardError=journal
-Environment=LANG=C.UTF-8
-
-[Install]
-WantedBy=multi-user.target
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
 )";
     }
 
-    run_local_cmd("systemctl daemon-reload");
-    run_local_cmd("systemctl enable madbackuper.service");
-    return run_local_cmd("systemctl restart madbackuper.service");
-}
+    {
+        std::ofstream timer("/etc/systemd/system/madbackuper-backup.timer", std::ios::trunc);
+        if (!timer) return 1;
+        timer << "[Unit]\nDescription=Daily madWebMirrorMagick backup\n\n"
+              << "[Timer]\nOnCalendar=*-*-* "
+              << (hh < 10 ? "0" : "") << hh << ':' << (mm < 10 ? "0" : "") << mm
+              << ":00\nPersistent=true\nRandomizedDelaySec=30\n\n"
+              << "[Install]\nWantedBy=timers.target\n";
+    }
 
-static int uninstall_local_service() {
-    run_local_cmd("systemctl stop madbackuper.service >/dev/null 2>&1");
-    run_local_cmd("systemctl disable madbackuper.service >/dev/null 2>&1");
-    run_local_cmd("rm -f /etc/systemd/system/madbackuper.service");
-    run_local_cmd("systemctl daemon-reload");
+    if (run_local("systemctl daemon-reload") != 0) return 1;
+    if (run_local("systemctl enable --now madbackuper-backup.timer") != 0) return 1;
     return 0;
 }
 
-// ───────────── Удалённый watchdog (скрипт + unit) на 202 (remote_host) ───────
-static int install_remote_watchdog(const Config& cfg)
-{
-    // --- 1) Bash-скрипт watchdog (как делали вручную)
+int uninstall_local_backup_timer() {
+    if (::geteuid() != 0) return 1;
+    run_local("systemctl disable --now madbackuper-backup.timer >/dev/null 2>&1", false);
+    run_local("rm -f /etc/systemd/system/madbackuper-backup.timer /etc/systemd/system/madbackuper-backup.service", false);
+    return run_local("systemctl daemon-reload", false);
+}
+
+int install_remote_watchdog(const Config& cfg) {
+    if (cfg.target_server != "nginx" || !cfg.switch_to_local) return 0;
+
+    const std::string switch_script = resolved_switch_script(cfg);
+    if (switch_script.empty()) {
+        std::cerr << "❌ Не удалось определить switch_script\n";
+        return 1;
+    }
+
     std::ostringstream script;
-    script
-    << "#!/usr/bin/env bash\n"
-    << "set -Eeuo pipefail\n"
-    << "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
-    << "SERVER_NAME=" << esc_s(cfg.server_name) << "\n"
-    << "PROXY_TARGET=" << esc_s(cfg.proxy_target) << "\n"
-    << "HTTP_PORT=" << (cfg.local_http_port > 0 ? cfg.local_http_port : 80) << "\n"
-    << "INTERVAL=" << (cfg.health_interval_sec > 0 ? cfg.health_interval_sec : 60) << "\n"
-    << "SETUP=\"/root/setup_${SERVER_NAME}_nginx.sh\"\n"
-    << "log(){ echo \"[watchdog] $*\"; }\n"
-    << "last_state=\"unknown\"\n"
-    << "while true; do\n"
-    << "  if curl -fsS -m 5 \"http://${PROXY_TARGET}:${HTTP_PORT}/\" >/dev/null 2>&1; then\n"
-    << "    state=\"up\"\n"
-    << "  else\n"
-    << "    state=\"down\"\n"
-    << "  fi\n"
-    << "  if [[ \"$state\" != \"$last_state\" ]]; then\n"
-    << "    if [[ \"$state\" == \"up\" ]]; then\n"
-    << "      log \"198 ↑ — переключаю 202 в remote\"\n"
-    << "      [[ -x \"$SETUP\" ]] && \"$SETUP\" remote || log \"нет $SETUP\"\n"
-    << "    else\n"
-    << "      log \"198 ↓ — переключаю 202 в local\"\n"
-    << "      [[ -x \"$SETUP\" ]] && \"$SETUP\" local  || log \"нет $SETUP\"\n"
-    << "    fi\n"
-    << "    last_state=\"$state\"\n"
-    << "  fi\n"
-    << "  sleep \"$INTERVAL\"\n"
-    << "done\n";
+    script << "#!/usr/bin/env bash\n"
+           << "set -Eeuo pipefail\n"
+           << "PROXY_TARGET=" << shell_quote(cfg.proxy_target) << "\n"
+           << "HTTP_PORT=" << cfg.local_http_port << "\n"
+           << "INTERVAL=" << cfg.health_interval_sec << "\n"
+           << "FAIL_LIMIT=" << cfg.health_failures << "\n"
+           << "RECOVER_LIMIT=" << cfg.health_recoveries << "\n"
+           << "COOLDOWN=" << cfg.switch_cooldown_sec << "\n"
+           << "SWITCH=" << shell_quote(switch_script) << "\n"
+           << "state=unknown; fails=0; oks=0; last_switch=0\n"
+           << "while true; do\n"
+           << "  now=$(date +%s)\n"
+           << "  if curl -fsS -m 5 \"http://${PROXY_TARGET}:${HTTP_PORT}/\" >/dev/null 2>&1; then\n"
+           << "    fails=0; oks=$((oks+1))\n"
+           << "    if [[ \"$state\" == backup && $oks -ge $RECOVER_LIMIT && $((now-last_switch)) -ge $COOLDOWN ]]; then\n"
+           << "      \"$SWITCH\" remote && state=primary && last_switch=$now\n"
+           << "    elif [[ \"$state\" == unknown && $oks -ge $RECOVER_LIMIT ]]; then state=primary; fi\n"
+           << "  else\n"
+           << "    oks=0; fails=$((fails+1))\n"
+           << "    if [[ \"$state\" != backup && $fails -ge $FAIL_LIMIT && $((now-last_switch)) -ge $COOLDOWN ]]; then\n"
+           << "      \"$SWITCH\" local && state=backup && last_switch=$now\n"
+           << "    fi\n"
+           << "  fi\n"
+           << "  sleep \"$INTERVAL\"\n"
+           << "done\n";
 
-    // --- 2) SSH + SFTP: кладём оба файла в /tmp на 202
-    ssh_session s = ssh_new();
-    if (!s) return -1;
-    ssh_options_set(s, SSH_OPTIONS_HOST, cfg.remote_host.c_str());
-    ssh_options_set(s, SSH_OPTIONS_USER, cfg.remote_user.c_str());
-    ssh_options_set(s, SSH_OPTIONS_PORT, &cfg.ssh_port);
-    if (ssh_connect(s) != SSH_OK) { ssh_free(s); return -1; }
-    if (ssh_userauth_password(s, nullptr, cfg.remote_pass.c_str()) != SSH_AUTH_SUCCESS) {
-        ssh_disconnect(s); ssh_free(s); return -1;
+    const std::string local_script = "/tmp/madbackuper-watchdog.sh";
+    const std::string local_unit = "/tmp/madbackuper-watchdog.service";
+    {
+        std::ofstream out(local_script, std::ios::trunc);
+        out << script.str();
     }
-
-    sftp_session sf = sftp_new(s);
-    if (!sf || sftp_init(sf) != SSH_OK) { if (sf) sftp_free(sf); ssh_disconnect(s); ssh_free(s); return -1; }
-
-    const std::string local_script = "/tmp/mad_watchdog_198.sh";
-    { std::ofstream f(local_script); f << script.str(); }
-
-    int sftp_err = 0;
-    if (sftp_upload_file_progress(s, sf, local_script, "/tmp/mad_watchdog_198.sh", "watchdog", &sftp_err, 0644) != 0) {
-        std::cerr << "❌ Не удалось загрузить watchdog на " << cfg.remote_host << " (SFTP)\n";
-        sftp_free(sf); ssh_disconnect(s); ssh_free(s); return -1;
-    }
-    sftp_free(sf);
-
-    // --- 3) Сборка unit-файла локально → /tmp на 202
-    std::ostringstream unit;
-    unit <<
-R"([Unit]
-Description=madbackuper remote watchdog (switch local/remote on 202)
+    {
+        std::ofstream out(local_unit, std::ios::trunc);
+        out << R"([Unit]
+Description=madWebMirrorMagick remote failover watchdog
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/env bash /usr/local/bin/mad_watchdog_198.sh
+ExecStart=/usr/local/bin/madbackuper-watchdog
 Restart=always
 RestartSec=5
 User=root
-StandardOutput=journal
-StandardError=journal
-Environment=LANG=C.UTF-8
 
 [Install]
 WantedBy=multi-user.target
 )";
-    const std::string local_unit = "/tmp/madbackuper-watchdog.service";
-    { std::ofstream u(local_unit); u << unit.str(); }
-
-    sftp_session sf2 = sftp_new(s);
-    if (!sf2 || sftp_init(sf2) != SSH_OK) { if (sf2) sftp_free(sf2); ssh_disconnect(s); ssh_free(s); return -1; }
-    if (sftp_upload_file_progress(s, sf2, local_unit, "/tmp/madbackuper-watchdog.service", "watchdog-unit", &sftp_err, 0644) != 0) {
-        std::cerr << "❌ Не удалось загрузить unit-файл на " << cfg.remote_host << "\n";
-        sftp_free(sf2); ssh_disconnect(s); ssh_free(s); return -1;
     }
-    sftp_free(sf2);
 
-    // --- 4) Повышенные права: КАЖДУЮ команду подаём как `printf %s PW | sudo -S ...`
-    const std::string pw = cfg.remote_sudo_pass.empty() ? cfg.remote_pass : cfg.remote_sudo_pass;
-    const std::string PW = esc_s(pw);
+    std::string error;
+    ssh_session session = ssh_connect_authenticated(cfg, error);
+    if (!session) {
+        std::cerr << "❌ " << error << '\n';
+        return 1;
+    }
 
-    // скрипт → /usr/local/bin, права 0755, удалить временный
-    {
-        std::ostringstream cmd;
-        cmd << "sh -lc 'set -e; "
-            << "printf %s " << PW << " | sudo -S -p \"\" mkdir -p /usr/local/bin; "
-            << "printf %s " << PW << " | sudo -S -p \"\" install -m 0755 /tmp/mad_watchdog_198.sh /usr/local/bin/mad_watchdog_198.sh; "
-            << "printf %s " << PW << " | sudo -S -p \"\" rm -f /tmp/mad_watchdog_198.sh"
-            << "'";
-        if (ssh_exec(s, cmd.str(), /*print_out=*/true) != 0) {
-            std::cerr << "❌ Не удалось установить /usr/local/bin/mad_watchdog_198.sh на " << cfg.remote_host << "\n";
-            ssh_disconnect(s); ssh_free(s); return -1;
+    sftp_session sftp = sftp_new(session);
+    if (!sftp || sftp_init(sftp) != SSH_OK) {
+        if (sftp) sftp_free(sftp);
+        ssh_disconnect_and_free(session);
+        return 1;
+    }
+
+    int sftp_error = 0;
+    const bool script_ok = sftp_upload_file_progress(session, sftp, local_script,
+        "/tmp/madbackuper-watchdog.sh", "watchdog", &sftp_error, 0700) == 0;
+    const bool unit_ok = sftp_upload_file_progress(session, sftp, local_unit,
+        "/tmp/madbackuper-watchdog.service", "watchdog unit", &sftp_error, 0600) == 0;
+    sftp_free(sftp);
+    ::unlink(local_script.c_str());
+    ::unlink(local_unit.c_str());
+
+    if (!script_ok || !unit_ok) {
+        ssh_disconnect_and_free(session);
+        return 1;
+    }
+
+    const std::string install =
+        "set -e; install -m 0755 /tmp/madbackuper-watchdog.sh /usr/local/bin/madbackuper-watchdog; "
+        "install -m 0644 /tmp/madbackuper-watchdog.service /etc/systemd/system/madbackuper-watchdog.service; "
+        "rm -f /tmp/madbackuper-watchdog.sh /tmp/madbackuper-watchdog.service; "
+        "systemctl daemon-reload; systemctl enable --now madbackuper-watchdog.service";
+
+    const int rc = ssh_exec(session, sudo_shell_command(cfg, install), true);
+    ssh_disconnect_and_free(session);
+    return rc == 0 ? 0 : 1;
+}
+
+int uninstall_remote_watchdog(const Config& cfg) {
+    if (cfg.target_server != "nginx") return 0;
+    const std::string command =
+        "systemctl disable --now madbackuper-watchdog.service >/dev/null 2>&1 || true; "
+        "rm -f /etc/systemd/system/madbackuper-watchdog.service /usr/local/bin/madbackuper-watchdog; "
+        "systemctl daemon-reload";
+    return ssh_exec_one(cfg, sudo_shell_command(cfg, command), true) == 0 ? 0 : 1;
+}
+
+} // namespace
+
+bool check_local_site_ok(const Config& cfg) {
+    const std::string url = cfg.health_url.empty()
+        ? "http://127.0.0.1:" + std::to_string(cfg.local_http_port) + "/"
+        : cfg.health_url;
+
+    std::ostringstream cmd;
+    cmd << "curl -fsSL -m 5 ";
+    if (!cfg.health_host_header.empty()) cmd << "-H " << shell_quote("Host: " + cfg.health_host_header) << ' ';
+    cmd << shell_quote(url) << " >/dev/null 2>&1";
+    return std::system(cmd.str().c_str()) == 0;
+}
+
+int remote_switch_to_local_nginx(const Config& cfg) {
+    return ssh_exec_one(cfg, build_nginx_switch_to_local_cmd(cfg), true);
+}
+
+int remote_switch_to_remote_nginx(const Config& cfg) {
+    return ssh_exec_one(cfg, build_nginx_switch_to_remote_cmd(cfg), true);
+}
+
+int run_monitor_loop(const Config& cfg) {
+    if (cfg.target_server != "nginx") {
+        std::cerr << "❌ Failover monitor сейчас поддерживает только nginx\n";
+        return 1;
+    }
+
+    int fails = 0;
+    int oks = 0;
+    bool backup_mode = false;
+    auto last_switch = std::chrono::steady_clock::now() - std::chrono::seconds(cfg.switch_cooldown_sec);
+
+    std::cout << "🌀 Monitor: fail=" << cfg.health_failures
+              << ", recover=" << cfg.health_recoveries << '\n';
+    while (true) {
+        const bool ok = check_local_site_ok(cfg);
+        if (ok) {
+            fails = 0;
+            ++oks;
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - last_switch).count();
+            if (backup_mode && oks >= cfg.health_recoveries && elapsed >= cfg.switch_cooldown_sec) {
+                if (remote_switch_to_remote_nginx(cfg) == 0) {
+                    backup_mode = false;
+                    last_switch = std::chrono::steady_clock::now();
+                }
+            }
+        } else {
+            oks = 0;
+            ++fails;
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - last_switch).count();
+            if (!backup_mode && fails >= cfg.health_failures && elapsed >= cfg.switch_cooldown_sec) {
+                if (remote_switch_to_local_nginx(cfg) == 0) {
+                    backup_mode = true;
+                    last_switch = std::chrono::steady_clock::now();
+                }
+            }
         }
+        std::this_thread::sleep_for(std::chrono::seconds(cfg.health_interval_sec));
     }
+}
 
-    // unit → /etc/systemd/system + enable/restart
-    {
-        std::ostringstream cmd;
-        cmd << "sh -lc 'set -e; "
-            << "printf %s " << PW << " | sudo -S -p \"\" mv /tmp/madbackuper-watchdog.service /etc/systemd/system/madbackuper-watchdog.service; "
-            << "printf %s " << PW << " | sudo -S -p \"\" systemctl daemon-reload; "
-            << "printf %s " << PW << " | sudo -S -p \"\" systemctl enable madbackuper-watchdog.service; "
-            << "printf %s " << PW << " | sudo -S -p \"\" systemctl restart madbackuper-watchdog.service"
-            << "'";
-        if (ssh_exec(s, cmd.str(), /*print_out=*/true) != 0) {
-            std::cerr << "❌ Не удалось зарегистрировать/запустить watchdog unit на " << cfg.remote_host << "\n";
-            ssh_disconnect(s); ssh_free(s); return -1;
-        }
+int daemon_install(const Config& cfg, const std::string& self_path) {
+    const std::string exe = self_path.empty() ? readlink_self() : self_path;
+    if (exe.empty()) return 1;
+
+    const int local_rc = install_local_backup_timer(cfg, exe);
+    const int remote_rc = install_remote_watchdog(cfg);
+    if (local_rc == 0 && remote_rc == 0) {
+        std::cout << "✅ Установлены backup timer и удалённый watchdog\n";
+        return 0;
     }
-
-    ssh_disconnect(s);
-    ssh_free(s);
-    return 0;
+    if (local_rc != 0) std::cerr << "❌ Не установлен локальный backup timer\n";
+    if (remote_rc != 0) std::cerr << "❌ Не установлен удалённый watchdog\n";
+    return 1;
 }
 
-static int uninstall_remote_watchdog(const Config& cfg)
-{
-    const std::string pw = cfg.remote_sudo_pass.empty() ? cfg.remote_pass : cfg.remote_sudo_pass;
-    const std::string PW = esc_s(pw);
-
-    std::ostringstream sh;
-    sh << "sh -lc 'set -e; "
-       << "printf %s " << PW << " | sudo -S -p \"\" systemctl stop madbackuper-watchdog.service >/dev/null 2>&1 || true; "
-       << "printf %s " << PW << " | sudo -S -p \"\" systemctl disable madbackuper-watchdog.service >/dev/null 2>&1 || true; "
-       << "printf %s " << PW << " | sudo -S -p \"\" rm -f /etc/systemd/system/madbackuper-watchdog.service; "
-       << "printf %s " << PW << " | sudo -S -p \"\" rm -f /usr/local/bin/mad_watchdog_198.sh; "
-       << "printf %s " << PW << " | sudo -S -p \"\" systemctl daemon-reload"
-       << "'";
-
-    return ssh_exec_one(cfg, sh.str(), /*print_out=*/true);
-}
-
-// ───────────────────────── Публичные API установки демона ────────────────────
-int daemon_install(const Config& cfg, const std::string& self_path)
-{
-    std::string exe = self_path.empty() ? readlink_self() : self_path;
-    if (exe.empty()) { std::cerr << "❌ Не удалось определить путь к бинарю\n"; return 1; }
-
-    int rc_local  = install_local_service(exe);
-    int rc_remote = install_remote_watchdog(cfg);
-
-    if (rc_local != 0)  std::cerr << "⚠️  Проблема при установке локального юнита\n";
-    if (rc_remote != 0) std::cerr << "⚠️  Проблема при установке удалённого watchdog'а на " << cfg.remote_host << "\n";
-
-    std::cout << "✅ Установка демона завершена. Логи: journalctl -u madbackuper -f\n";
-    return 0; // завершаем текущий процесс — дальше рулит systemd
-}
-
-int daemon_uninstall(const Config& cfg)
-{
-    int rc_remote = uninstall_remote_watchdog(cfg);
-    int rc_local  = uninstall_local_service();
-
-    if (rc_remote != 0) std::cerr << "⚠️  Не удалось корректно убрать watchdog на " << cfg.remote_host << "\n";
-    std::cout << "✅ Демон отключён локально. Для проверки: systemctl status madbackuper\n";
-    return rc_local == 0 ? 0 : rc_local;
+int daemon_uninstall(const Config& cfg) {
+    const int remote_rc = uninstall_remote_watchdog(cfg);
+    const int local_rc = uninstall_local_backup_timer();
+    return local_rc == 0 && remote_rc == 0 ? 0 : 1;
 }
 
 } // namespace mad
