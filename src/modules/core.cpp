@@ -11,6 +11,8 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include "mad/transport.hpp"
+
 namespace mad {
 
 std::string trim(const std::string& s) {
@@ -139,6 +141,16 @@ remote_user=madbackup
 remote_pass=
 remote_sudo_pass=
 
+# SSH management path: direct | jump | auto.
+# jump: private node доступен только через один из двух Proxy/bastion.
+# auto: сначала direct, затем primary/fallback Proxy.
+ssh_transport=direct
+ssh_identity_file=
+ssh_jump_primary=
+ssh_jump_primary_identity_file=
+ssh_jump_fallback=
+ssh_jump_fallback_identity_file=
+
 local_site_dir=/webserver/madmentat.ru
 remote_site_dir=/webserver/madmentat.ru
 remote_backup_base=/webserver/.backup
@@ -178,35 +190,41 @@ schedule_hhmm=04:00
 }
 
 static void assign_config_value(Config& cfg, const std::string& key, const std::string& value) {
-    if      (key == "target_server")         cfg.target_server = value;
-    else if (key == "remote_host")           cfg.remote_host = value;
-    else if (key == "ssh_port")              cfg.ssh_port = parse_int(value, key);
-    else if (key == "remote_user")           cfg.remote_user = value;
-    else if (key == "remote_pass")           cfg.remote_pass = value;
-    else if (key == "remote_sudo_pass")      cfg.remote_sudo_pass = value;
-    else if (key == "local_site_dir")        cfg.local_site_dir = value;
-    else if (key == "remote_site_dir")       cfg.remote_site_dir = value;
-    else if (key == "remote_backup_base")    cfg.remote_backup_base = value;
-    else if (key == "server_name")           cfg.server_name = value;
-    else if (key == "switch_script")         cfg.switch_script = value;
-    else if (key == "php_version")           cfg.php_version = value;
-    else if (key == "php_fpm_sock")          cfg.php_fpm_sock = value;
-    else if (key == "db_user")               cfg.db_user = value;
-    else if (key == "db_pass")               cfg.db_pass = value;
-    else if (key == "db_name")               cfg.db_name = value;
-    else if (key == "proxy_target")          cfg.proxy_target = value;
-    else if (key == "local_http_port")       cfg.local_http_port = parse_int(value, key);
-    else if (key == "local_https_port")      cfg.local_https_port = parse_int(value, key);
-    else if (key == "switch_to_local")       cfg.switch_to_local = parse_bool(value);
-    else if (key == "health_url")            cfg.health_url = value;
-    else if (key == "health_host_header")    cfg.health_host_header = value;
-    else if (key == "health_interval_sec")   cfg.health_interval_sec = parse_int(value, key);
-    else if (key == "health_failures")       cfg.health_failures = parse_int(value, key);
-    else if (key == "health_recoveries")     cfg.health_recoveries = parse_int(value, key);
-    else if (key == "switch_cooldown_sec")   cfg.switch_cooldown_sec = parse_int(value, key);
-    else if (key == "ssl_cert")              cfg.ssl_cert = value;
-    else if (key == "ssl_key")               cfg.ssl_key = value;
-    else if (key == "schedule_hhmm")         cfg.schedule_hhmm = value;
+    if      (key == "target_server")                 cfg.target_server = value;
+    else if (key == "remote_host")                   cfg.remote_host = value;
+    else if (key == "ssh_port")                      cfg.ssh_port = parse_int(value, key);
+    else if (key == "remote_user")                   cfg.remote_user = value;
+    else if (key == "remote_pass")                   cfg.remote_pass = value;
+    else if (key == "remote_sudo_pass")              cfg.remote_sudo_pass = value;
+    else if (key == "ssh_transport")                 cfg.ssh_transport = value;
+    else if (key == "ssh_identity_file")             cfg.ssh_identity_file = value;
+    else if (key == "ssh_jump_primary")              cfg.ssh_jump_primary = value;
+    else if (key == "ssh_jump_primary_identity_file") cfg.ssh_jump_primary_identity_file = value;
+    else if (key == "ssh_jump_fallback")             cfg.ssh_jump_fallback = value;
+    else if (key == "ssh_jump_fallback_identity_file") cfg.ssh_jump_fallback_identity_file = value;
+    else if (key == "local_site_dir")                cfg.local_site_dir = value;
+    else if (key == "remote_site_dir")               cfg.remote_site_dir = value;
+    else if (key == "remote_backup_base")            cfg.remote_backup_base = value;
+    else if (key == "server_name")                   cfg.server_name = value;
+    else if (key == "switch_script")                 cfg.switch_script = value;
+    else if (key == "php_version")                   cfg.php_version = value;
+    else if (key == "php_fpm_sock")                  cfg.php_fpm_sock = value;
+    else if (key == "db_user")                       cfg.db_user = value;
+    else if (key == "db_pass")                       cfg.db_pass = value;
+    else if (key == "db_name")                       cfg.db_name = value;
+    else if (key == "proxy_target")                  cfg.proxy_target = value;
+    else if (key == "local_http_port")               cfg.local_http_port = parse_int(value, key);
+    else if (key == "local_https_port")              cfg.local_https_port = parse_int(value, key);
+    else if (key == "switch_to_local")               cfg.switch_to_local = parse_bool(value);
+    else if (key == "health_url")                    cfg.health_url = value;
+    else if (key == "health_host_header")            cfg.health_host_header = value;
+    else if (key == "health_interval_sec")           cfg.health_interval_sec = parse_int(value, key);
+    else if (key == "health_failures")               cfg.health_failures = parse_int(value, key);
+    else if (key == "health_recoveries")             cfg.health_recoveries = parse_int(value, key);
+    else if (key == "switch_cooldown_sec")           cfg.switch_cooldown_sec = parse_int(value, key);
+    else if (key == "ssl_cert")                      cfg.ssl_cert = value;
+    else if (key == "ssl_key")                       cfg.ssl_key = value;
+    else if (key == "schedule_hhmm")                 cfg.schedule_hhmm = value;
 }
 
 void load_kv_file(const std::string& path, Config& cfg) {
@@ -274,6 +292,13 @@ bool validate(const Config& cfg, std::string& err) {
 
     if (cfg.ssh_port <= 0 || cfg.ssh_port > 65535) {
         err = "ssh_port должен быть в диапазоне 1..65535";
+        return false;
+    }
+    try {
+        const auto profile = transport_profile_from_config(cfg);
+        if (!validate_transport_profile(profile, err)) return false;
+    } catch (const std::exception& e) {
+        err = e.what();
         return false;
     }
     if (cfg.local_http_port <= 0 || cfg.local_http_port > 65535) {
