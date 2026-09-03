@@ -51,6 +51,48 @@ server-B: web + db + proxy + agent
 
 When both nodes share an L2 network, VRRP/keepalived with a floating virtual IP is the preferred ingress ownership mechanism. For nodes in different networks, the ingress ownership mechanism may instead be DNS failover or an external load balancer. madWebMirrorMagick must treat this as a strategy, not hard-code one network topology.
 
+## SSH reachability, NAT and redundant Proxy tunnels
+
+Management reachability is independent from node role. A web backend may live behind NAT and have no public SSH port at all. In that case either ingress node may also act as an SSH bastion.
+
+For every managed target there are three transport modes:
+
+```text
+direct  controller -----------> target
+jump    controller -> Proxy A -> target
+                    \> Proxy B -> target   (fallback route)
+auto    direct first, then Proxy A, then Proxy B
+```
+
+Proxy A and Proxy B are **alternative routes**. They are not a serial Proxy A -> Proxy B chain. Losing either proxy must not remove administrative access to a private backend if the other proxy still has a path to it.
+
+Current flat-config compatibility fields are:
+
+```ini
+ssh_transport=jump
+ssh_identity_file=/var/lib/madwebmirror/ssh/private-web
+
+ssh_jump_primary=madbackup@proxy-a.example.net:22
+ssh_jump_primary_identity_file=/var/lib/madwebmirror/ssh/proxy-a
+
+ssh_jump_fallback=madbackup@proxy-b.example.net:22
+ssh_jump_fallback_identity_file=/var/lib/madwebmirror/ssh/proxy-b
+```
+
+The target host may then be a private address such as `192.168.1.20`. The management connection first tries Proxy A and automatically retries through Proxy B when A is unavailable.
+
+Jump connections use OpenSSH as the forwarding process because Ubuntu 24.04 currently ships libssh 0.10.x, while native libssh ProxyJump support arrived later. The jump command is generated only from validated `[user@]host[:port]` fields, runs in batch mode, requires strict host-key checking and does not support jump-host password authentication. Each jump route may use its own identity key.
+
+The topology model also reserves a list of `SshTunnelSpec` objects on each jump route. This is the place for persistent LocalForward/RemoteForward definitions in madUI. A future tunnel supervisor can materialize those definitions as agent-managed/systemd tunnels without changing the node/ingress schema.
+
+Key policy:
+
+- target and both Proxy nodes may use different keys;
+- jump-host passwords are not stored for runtime use;
+- first enrollment may use a temporary password only to install the generated public key;
+- host keys for both proxies and the final target must be trusted explicitly;
+- compromising one Proxy key must not automatically grant access to every other node.
+
 ## Runtime privilege model
 
 Normal runtime processes should run as the dedicated unprivileged service account `madbackup`.
@@ -114,7 +156,8 @@ Future TLS/443 support should follow the same model: fixed templates and explici
 - controller/madUI fails -> existing routing and backup policy continue;
 - one backend fails -> ingress routes to another healthy backend;
 - active ingress fails -> standby ingress assumes public traffic;
+- one SSH bastion/Proxy fails -> management retries the private node through the other Proxy;
 - one whole node fails in a two-node combined web+proxy deployment -> the surviving node can own ingress and serve its local copy;
 - all ingress nodes fail -> public service is unavailable.
 
-This keeps the controller out of the critical traffic path and removes the single-proxy failure mode.
+This keeps the controller out of the critical traffic path and removes both the single-proxy traffic failure mode and the single-bastion management failure mode.
