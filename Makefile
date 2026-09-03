@@ -1,22 +1,29 @@
-CXX      := g++
-CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -Iinclude
-LDFLAGS  := -lssh
+CXX      ?= g++
+CPPFLAGS := -Iinclude
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
+LDLIBS   := -lssh
+
 TARGET   := madbackuper
-
-SRC_MAIN := src/main.cpp
-SRC_MODS := $(wildcard src/modules/*.cpp)
-
-OBJ := $(SRC_MAIN:.cpp=.o) $(SRC_MODS:.cpp=.o)
+SOURCES  := $(wildcard src/*.cpp) $(wildcard src/modules/*.cpp)
+OBJECTS  := $(patsubst %.cpp,build/%.o,$(SOURCES))
+DEPS     := $(OBJECTS:.o=.d)
 
 all: $(TARGET)
 
-$(TARGET): $(OBJ)
-	$(CXX) $(CXXFLAGS) -o $@ $(OBJ) $(LDFLAGS)
+$(TARGET): $(OBJECTS)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
 
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+build/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -rf build $(TARGET)
 
-.PHONY: all clean
+debug: CXXFLAGS := -std=c++17 -O1 -g3 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer
+debug: LDLIBS += -fsanitize=address,undefined
+debug: clean all
+
+-include $(DEPS)
+
+.PHONY: all clean debug
