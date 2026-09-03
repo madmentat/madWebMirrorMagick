@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -13,8 +14,6 @@
 #include <memory>
 #include <sstream>
 #include <vector>
-
-#include <libssh/callbacks.h>
 
 #include "mad/transport.hpp"
 
@@ -61,35 +60,133 @@ bool verify_known_host(ssh_session session, std::string& err) {
     return false;
 }
 
-struct JumpAuthContext {
-    std::string identity_file;
-    std::string error;
+struct JumpEndpoint {
+    std::string user;
+    std::string host;
+    int port{22};
 };
 
-int jump_before_connection(ssh_session session, void* userdata) {
-    auto* ctx = static_cast<JumpAuthContext*>(userdata);
-    if (!ctx || ctx->identity_file.empty()) return SSH_OK;
-    if (ssh_options_set(session, SSH_OPTIONS_IDENTITY, ctx->identity_file.c_str()) != SSH_OK) {
-        ctx->error = std::string("Не удалось настроить ключ jump-host: ") + ssh_get_error(session);
-        return SSH_ERROR;
+bool is_safe_user(const std::string& value) {
+    if (value.empty()) return false;
+    for (unsigned char c : value) {
+        if (!(std::isalnum(c) || c == '_' || c == '-' || c == '.')) return false;
     }
-    return SSH_OK;
+    return true;
 }
 
-int jump_verify_knownhost(ssh_session session, void* userdata) {
-    auto* ctx = static_cast<JumpAuthContext*>(userdata);
-    std::string error;
-    if (verify_known_host(session, error)) return SSH_OK;
-    if (ctx) ctx->error = "Jump-host: " + error;
-    return SSH_ERROR;
+bool is_safe_host(const std::string& value) {
+    if (value.empty()) return false;
+    for (unsigned char c : value) {
+        if (!(std::isalnum(c) || c == '_' || c == '-' || c == '.' || c == ':')) return false;
+    }
+    return true;
 }
 
-int jump_authenticate(ssh_session session, void* userdata) {
-    auto* ctx = static_cast<JumpAuthContext*>(userdata);
-    const int auth = ssh_userauth_publickey_auto(session, nullptr, nullptr);
-    if (auth == SSH_AUTH_SUCCESS) return SSH_OK;
-    if (ctx) ctx->error = std::string("Аутентификация ключом на jump-host не удалась: ") + ssh_get_error(session);
-    return SSH_ERROR;
+bool parse_jump_endpoint(const std::string& spec, JumpEndpoint& out, std::string& err) {
+    out = JumpEndpoint{};
+    err.clear();
+    if (spec.empty()) {
+        err = "jump-host пуст";
+        return false;
+    }
+
+    std::string host_port = spec;
+    const auto at = spec.find('@');
+    if (at != std::string::npos) {
+        if (spec.find('@', at + 1) != std::string::npos) {
+            err = "jump-host содержит несколько @";
+            return false;
+        }
+        out.user = spec.substr(0, at);
+        host_port = spec.substr(at + 1);
+        if (!is_safe_user(out.user)) {
+            err = "Недопустимое имя SSH-пользователя в jump-host";
+            return false;
+        }
+    }
+
+    if (!host_port.empty() && host_port.front() == '[') {
+        const auto close = host_port.find(']');
+        if (close == std::string::npos) {
+            err = "Некорректный IPv6 jump-host";
+            return false;
+        }
+        out.host = host_port.substr(1, close - 1);
+        if (close + 1 < host_port.size()) {
+            if (host_port[close + 1] != ':') {
+                err = "После ] в jump-host ожидается :PORT";
+                return false;
+            }
+            const std::string port_s = host_port.substr(close + 2);
+            try {
+                std::size_t used = 0;
+                out.port = std::stoi(port_s, &used);
+                if (used != port_s.size()) throw std::invalid_argument("tail");
+            } catch (...) {
+                err = "Некорректный порт jump-host";
+                return false;
+            }
+        }
+    } else {
+        const auto first_colon = host_port.find(':');
+        const auto last_colon = host_port.rfind(':');
+        if (first_colon != std::string::npos && first_colon != last_colon) {
+            err = "IPv6 jump-host нужно указывать в [addr]:port";
+            return false;
+        }
+        if (last_colon != std::string::npos) {
+            out.host = host_port.substr(0, last_colon);
+            const std::string port_s = host_port.substr(last_colon + 1);
+            try {
+                std::size_t used = 0;
+                out.port = std::stoi(port_s, &used);
+                if (used != port_s.size()) throw std::invalid_argument("tail");
+            } catch (...) {
+                err = "Некорректный порт jump-host";
+                return false;
+            }
+        } else {
+            out.host = host_port;
+        }
+    }
+
+    if (!is_safe_host(out.host)) {
+        err = "Недопустимый hostname/IP в jump-host";
+        return false;
+    }
+    if (out.port <= 0 || out.port > 65535) {
+        err = "Порт jump-host должен быть 1..65535";
+        return false;
+    }
+    return true;
+}
+
+bool build_proxy_command(const std::string& proxy_jump,
+                         const std::string& jump_identity,
+                         std::string& command,
+                         std::string& err) {
+    JumpEndpoint jump;
+    if (!parse_jump_endpoint(proxy_jump, jump, err)) return false;
+    if (!has_command("ssh")) {
+        err = "Для jump transport требуется openssh-client (команда ssh)";
+        return false;
+    }
+
+    std::ostringstream cmd;
+    cmd << "ssh"
+        << " -o BatchMode=yes"
+        << " -o StrictHostKeyChecking=yes"
+        << " -o ConnectTimeout=10"
+        << " -o ServerAliveInterval=15"
+        << " -o ServerAliveCountMax=2";
+    if (!jump_identity.empty()) {
+        cmd << " -o IdentitiesOnly=yes -i " << shell_quote(jump_identity);
+    }
+    if (!jump.user.empty()) cmd << " -l " << shell_quote(jump.user);
+    cmd << " -p " << jump.port
+        << " -W %h:%p " << shell_quote(jump.host);
+    command = cmd.str();
+    return true;
 }
 
 ssh_session connect_one(const Config& cfg,
@@ -117,26 +214,21 @@ ssh_session connect_one(const Config& cfg,
         }
     }
 
-    JumpAuthContext jump_ctx;
-    ssh_jump_callbacks_struct jump_cb{};
+    std::string proxy_command;
     if (!proxy_jump.empty()) {
-        jump_ctx.identity_file = jump_identity;
-        jump_cb.userdata = &jump_ctx;
-        jump_cb.before_connection = jump_before_connection;
-        jump_cb.verify_knownhost = jump_verify_knownhost;
-        jump_cb.authenticate = jump_authenticate;
-
-        if (ssh_options_set(session, SSH_OPTIONS_PROXYJUMP, proxy_jump.c_str()) != SSH_OK ||
-            ssh_options_set(session, SSH_OPTIONS_PROXYJUMP_CB_LIST_APPEND, &jump_cb) != SSH_OK) {
-            err = std::string("Не удалось настроить ProxyJump ") + proxy_jump + ": " + ssh_get_error(session);
+        if (!build_proxy_command(proxy_jump, jump_identity, proxy_command, err)) {
+            ssh_free(session);
+            return nullptr;
+        }
+        if (ssh_options_set(session, SSH_OPTIONS_PROXYCOMMAND, proxy_command.c_str()) != SSH_OK) {
+            err = std::string("Не удалось настроить SSH ProxyCommand для ") + proxy_jump + ": " + ssh_get_error(session);
             ssh_free(session);
             return nullptr;
         }
     }
 
     if (ssh_connect(session) != SSH_OK) {
-        if (!jump_ctx.error.empty()) err = jump_ctx.error;
-        else err = std::string("ssh_connect: ") + ssh_get_error(session);
+        err = std::string("ssh_connect: ") + ssh_get_error(session);
         ssh_free(session);
         return nullptr;
     }
