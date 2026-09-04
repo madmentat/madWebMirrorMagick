@@ -1,6 +1,8 @@
 # build
 build/
 madbackuper
+madweb-helper
+madweb-agent
 *.o
 *.obj
 *.a

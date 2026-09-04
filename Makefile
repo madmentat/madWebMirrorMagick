@@ -5,11 +5,12 @@ LDLIBS   := -lssh -pthread
 
 TARGET   := madbackuper
 HELPER   := madweb-helper
+AGENT    := madweb-agent
 SOURCES  := $(wildcard src/*.cpp) $(wildcard src/modules/*.cpp)
 OBJECTS  := $(patsubst %.cpp,build/%.o,$(SOURCES))
 DEPS     := $(OBJECTS:.o=.d)
 
-all: $(TARGET) $(HELPER)
+all: $(TARGET) $(HELPER) $(AGENT)
 
 $(TARGET): $(OBJECTS)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJECTS) $(LDLIBS)
@@ -17,12 +18,15 @@ $(TARGET): $(OBJECTS)
 $(HELPER): tools/madweb-helper.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $<
 
+$(AGENT): tools/madweb-agent.cpp
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -o $@ $<
+
 build/%.o: %.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 clean:
-	rm -rf build $(TARGET) $(HELPER)
+	rm -rf build $(TARGET) $(HELPER) $(AGENT)
 
 debug: CXXFLAGS := -std=c++17 -O1 -g3 -Wall -Wextra -Wpedantic -pthread -fsanitize=address,undefined -fno-omit-frame-pointer
 debug: LDLIBS += -fsanitize=address,undefined

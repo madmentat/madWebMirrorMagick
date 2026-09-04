@@ -172,6 +172,9 @@ local_https_port=0
 switch_to_local=true
 
 health_url=http://127.0.0.1:80/
+# URL основного backend с точки зрения резервного узла.
+# Если пусто, watchdog использует http://proxy_target:local_http_port/.
+watchdog_health_url=
 health_host_header=
 health_interval_sec=60
 health_failures=3
@@ -217,6 +220,7 @@ static void assign_config_value(Config& cfg, const std::string& key, const std::
     else if (key == "local_https_port")              cfg.local_https_port = parse_int(value, key);
     else if (key == "switch_to_local")               cfg.switch_to_local = parse_bool(value);
     else if (key == "health_url")                    cfg.health_url = value;
+    else if (key == "watchdog_health_url")           cfg.watchdog_health_url = value;
     else if (key == "health_host_header")            cfg.health_host_header = value;
     else if (key == "health_interval_sec")           cfg.health_interval_sec = parse_int(value, key);
     else if (key == "health_failures")               cfg.health_failures = parse_int(value, key);

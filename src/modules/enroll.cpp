@@ -127,7 +127,9 @@ void chown_to_service_user(const std::filesystem::path& path) {
     if (::geteuid() != 0) return;
     passwd* pw = service_user();
     if (!pw) return;
-    ::chown(path.c_str(), pw->pw_uid, pw->pw_gid);
+    if (::chown(path.c_str(), pw->pw_uid, pw->pw_gid) != 0) {
+        std::cerr << "⚠️ Не удалось передать " << path << " пользователю madbackup\n";
+    }
 }
 
 std::string service_command_prefix() {

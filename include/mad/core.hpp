@@ -49,6 +49,9 @@ struct Config {
     bool switch_to_local{true};
 
     std::string health_url;
+    // URL основного backend, который проверяет автономный watchdog на mirror.
+    // Если пусто, используется http://<proxy_target>:<local_http_port>/.
+    std::string watchdog_health_url;
     std::string health_host_header;
     int health_interval_sec{60};
     int health_failures{3};

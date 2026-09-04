@@ -6,6 +6,7 @@ UI_BIND="${MADUI_BIND:-0.0.0.0}"
 PREFIX="${MADWEB_PREFIX:-/usr/local}"
 BIN_DST="$PREFIX/bin/madwebmirror"
 HELPER_DST="$PREFIX/libexec/madweb-helper"
+AGENT_DST="$PREFIX/libexec/madweb-agent"
 SERVICE_USER="madbackup"
 
 if [[ "${EUID}" -eq 0 ]]; then
@@ -89,6 +90,7 @@ echo "📥 Устанавливаю основной бинарник и privile
 $SUDO install -m 0755 ./madbackuper "$BIN_DST"
 $SUDO ln -sfn "$BIN_DST" "$PREFIX/bin/madbackuper"
 $SUDO install -o root -g root -m 0755 ./madweb-helper "$HELPER_DST"
+$SUDO install -o root -g root -m 0755 ./madweb-agent "$AGENT_DST"
 
 SUDOERS_TMP="$(mktemp)"
 trap 'rm -f "$SUDOERS_TMP"' EXIT
@@ -138,6 +140,7 @@ echo "✅ Runtime privilege model установлен:"
 echo "   • $SERVICE_USER не имеет shell-login;"
 echo "   • sudo/root пароль программе не нужен;"
 echo "   • privileged операции доступны только через $HELPER_DST;"
+echo "   • автономный failover agent: $AGENT_DST;"
 echo "   • web-копии создаются под /srv/madwebmirror/sites/<site-id>;"
 echo "   • SSH keys хранятся в /var/lib/madwebmirror/ssh;"
 echo "   • SSH trust store: /var/lib/madwebmirror/.ssh/known_hosts;"

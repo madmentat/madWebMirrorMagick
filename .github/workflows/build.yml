@@ -22,3 +22,5 @@ jobs:
           printf '# empty first-run config\n' >/tmp/madwebmirror-ci.conf
           printf '# empty tunnel policy\n' >/tmp/madwebmirror-tunnels-ci.conf
           ./madbackuper tunnels --config=/tmp/madwebmirror-ci.conf --tunnels=/tmp/madwebmirror-tunnels-ci.conf
+      - name: Autonomous watchdog smoke test
+        run: bash tests/watchdog-agent-smoke.sh

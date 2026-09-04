@@ -15,13 +15,17 @@ A physical or virtual machine is a **node**. A node may expose several capabilit
 
 ## Control plane vs data plane
 
-The control plane (madUI/controller) distributes configuration and observes the system. Losing it must not stop already configured backups or failover.
+The control plane (madUI/controller) distributes configuration and observes the system. Losing it must not stop already configured failover. Distributed backup scheduling is not implemented yet: when the controller host is down, no new backup is produced.
 
-The data plane serves traffic. Agents keep the last accepted configuration locally and continue autonomously when the controller is offline.
+The data plane serves traffic. The failover agent on the mirror keeps its last accepted configuration and route state locally and continues autonomously when the controller is offline. On every restart it reapplies the route selected from fresh health checks instead of trusting stale in-memory state.
 
 ## Dual ingress (two Proxy-capable nodes)
 
 A single proxy is a single point of failure, so public traffic should be represented as an **Ingress Group** with at least two proxy-capable nodes.
+
+This section describes the target design. The current release has redundant SSH
+routes through Proxy A and Proxy B, but it does not yet transfer ownership of a
+public HTTP/HTTPS ingress between two proxy nodes.
 
 Example:
 
@@ -157,11 +161,20 @@ Future TLS/443 support should follow the same model: fixed templates and explici
 
 ## Failure expectations
 
-- controller/madUI fails -> existing routing and backup policy continue;
-- one backend fails -> ingress routes to another healthy backend;
-- active ingress fails -> standby ingress assumes public traffic;
+Implemented now:
+
+- controller/madUI fails -> the installed mirror watchdog and existing routing continue, but new backups stop until a distributed scheduler is implemented;
+- the monitored primary backend fails -> the mirror watchdog invokes the fixed switch script and serves the last deployed local copy;
 - one SSH bastion/Proxy fails -> management retries the private node through the other Proxy;
-- one whole node fails in a two-node combined web+proxy deployment -> the surviving node can own ingress and serve its local copy;
+
+Target design, not implemented yet:
+
+- one backend fails -> either ingress routes to another healthy backend;
+- active ingress fails -> standby ingress assumes public traffic;
+- one whole node fails in a two-node combined web+proxy deployment -> the surviving node owns ingress and serves its local copy;
 - all ingress nodes fail -> public service is unavailable.
 
-This keeps the controller out of the critical traffic path and removes both the single-proxy traffic failure mode and the single-bastion management failure mode.
+The current agent removes the controller from the already-installed failover
+decision, and the dual SSH routes remove the single-bastion management failure
+mode. Removing the single-proxy traffic failure mode still requires an ingress
+ownership strategy such as VRRP, DNS failover or an external load balancer.

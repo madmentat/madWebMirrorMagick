@@ -72,6 +72,7 @@ void save_config(const std::string& path, const Config& cfg) {
         << "local_https_port=" << cfg.local_https_port << '\n'
         << "switch_to_local=" << (cfg.switch_to_local ? "true" : "false") << '\n'
         << "\nhealth_url=" << cfg.health_url << '\n'
+        << "watchdog_health_url=" << cfg.watchdog_health_url << '\n'
         << "health_host_header=" << cfg.health_host_header << '\n'
         << "health_interval_sec=" << cfg.health_interval_sec << '\n'
         << "health_failures=" << cfg.health_failures << '\n'
