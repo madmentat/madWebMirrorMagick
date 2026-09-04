@@ -1,103 +1,121 @@
 # madWebMirrorMagick
 
-`madWebMirrorMagick` — утилита для зеркалирования и отказоустойчивости веб-серверов: резервное копирование файлов и БД, передача на резервные узлы, health-check, failover и управление двумя взаимозаменяемыми Proxy.
+**madWebMirrorMagick** — утилита для резервного копирования, зеркалирования и аварийного переключения веб-серверов.
 
-Текущая ветка `develop` содержит модульную архитектуру и встроенную административную панель **madUI**.
+Она создаёт копии файлов и базы данных, передаёт их на резервный узел, проверяет доступность основного сайта и управляет переключением между рабочими backend-серверами. Для узлов за NAT поддерживаются два взаимозаменяемых SSH-маршрута через Proxy A и Proxy B.
 
-## Быстрый старт
+Проект рассчитан прежде всего на Debian и Ubuntu, nginx или Apache, MySQL/MariaDB и systemd.
 
-На Ubuntu/Debian-подобном сервере:
+## Возможности
 
-```bash
-./install.sh
-```
+- резервное копирование каталога сайта и базы данных;
+- передача архивов через SSH/SFTP;
+- развёртывание копии на удалённом сервере;
+- ежедневный backup по расписанию;
+- health-check и автоматическое переключение frontend-маршрута;
+- защита от ложных переключений при кратковременных сбоях;
+- прямой SSH-доступ или подключение через два альтернативных Proxy;
+- постоянные LocalForward и RemoteForward SSH-туннели;
+- автоматическое переключение туннеля между Proxy A и Proxy B;
+- SSH enrollment с отдельными ключами Ed25519;
+- строгая проверка ключей узлов через общий `known_hosts`;
+- встроенная административная панель **madUI**;
+- работа основных служб от непривилегированного пользователя `madbackup`;
+- ограниченный root-helper для необходимых системных операций;
+- установка бинарников, systemd-служб и каталогов одним скриптом.
 
-Если файл был получен без executable-bit:
-
-```bash
-bash install.sh
-```
-
-Установщик:
-
-1. проверяет sudo-сеанс;
-2. устанавливает `build-essential`, `libssh-dev`, `openssh-client` и `sudo`, если они нужны;
-3. собирает проект;
-4. создаёт непривилегированного системного пользователя `madbackup`;
-5. устанавливает `/usr/local/bin/madwebmirror` и совместимый alias `madbackuper`;
-6. устанавливает root-owned `/usr/local/libexec/madweb-helper` и узкое sudoers-правило только на него;
-7. создаёт `/srv/madwebmirror`, `/var/lib/madwebmirror/ssh` и общий SSH trust store;
-8. устанавливает `madwebmirror-tunnels.service` под `User=madbackup`;
-9. сразу запускает **madUI**.
-
-После запуска терминал печатает адрес вида:
+## Схема работы
 
 ```text
-http://192.168.88.198:8790/
+                         Controller / madUI
+                           /             \
+                          /               \
+                     Proxy A            Proxy B
+                        \                 /
+                         \               /
+                          main <-----> mirror
 ```
 
-Откройте его в браузере. Вкладка получает одноразовый код, например `F7K2-W9Q4`. В том же sudo-терминале появится запрос с IP и User-Agent браузера. Только после подтверждения `y` вкладке выдаётся временная `HttpOnly` session-cookie.
-
-**Пароль sudo/root сама программа не получает и не сохраняет.** После `Ctrl+C` madUI завершается, browser-session исчезают из памяти.
-
-## Два Proxy и узлы за NAT
-
-Proxy — capability узла, а не отдельный жёсткий тип машины. Proxy A и Proxy B являются альтернативными bastion-маршрутами:
+Proxy A и Proxy B — альтернативные маршруты, а не последовательная цепочка. Если один Proxy недоступен, контроллер может связаться с приватным узлом через второй.
 
 ```text
-                 Controller / madUI
-                   /             \
-                  /               \
-             Proxy A            Proxy B
-               |                   |
-               +--------+----------+
-                        |
-                  private web node
-                    192.168.1.20
-```
-
-Для managed target доступны transport modes:
-
-```text
-direct  controller ----------------------> target
+direct  controller ---------------------> target
 jump    controller -> Proxy A ----------> target
                     -> Proxy B ----------> target (fallback)
 auto    direct, затем Proxy A, затем Proxy B
 ```
 
-Proxy A и Proxy B не образуют последовательную цепочку A → B. Если один Proxy недоступен, управление приватным backend должно оставаться доступным через второй.
+Подробное описание ролей узлов, привилегий и отказоустойчивости находится в [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+## Требования
+
+- Linux с systemd;
+- компилятор C++17 и GNU Make;
+- libssh и OpenSSH client;
+- `sudo`;
+- `tar`, `curl` и клиент MySQL/MariaDB для рабочих операций;
+- nginx или Apache на обслуживаемых узлах.
+
+## Установка
+
+На Debian или Ubuntu:
+
+```bash
+git clone https://github.com/madmentat/madWebMirrorMagick.git
+cd madWebMirrorMagick
+sudo ./install.sh
+```
+
+Если исполняемый бит скрипта потерялся:
+
+```bash
+sudo bash install.sh
+```
+
+Установщик проверяет зависимости, собирает проект, создаёт пользователя `madbackup`, устанавливает `madwebmirror` и совместимое имя `madbackuper`, создаёт служебные каталоги, устанавливает tunnel supervisor и запускает первоначальную настройку через madUI.
+
+Ручная сборка:
+
+```bash
+sudo apt-get install build-essential libssh-dev openssh-client sudo
+make -j"$(nproc)"
+```
+
+Отладочная сборка с AddressSanitizer и UndefinedBehaviorSanitizer:
+
+```bash
+make debug
+```
+
+## Первоначальная настройка
+
+```bash
+sudo madwebmirror ui
+```
+
+По умолчанию панель слушает IPv4-адрес `0.0.0.0:8790`. Ограничить доступ локальным компьютером можно так:
+
+```bash
+sudo madwebmirror ui --ui-bind=127.0.0.1 --ui-port=8790
+```
+
+При открытии панели браузер получает одноразовый код. Новый сеанс начинает работать только после подтверждения в том же терминале, из которого запущена madUI. Пароль `sudo` или `root` в браузер не передаётся и приложением не сохраняется.
+
+Через madUI настраиваются узлы, тип веб-сервера, каталоги, база данных, расписание, health-check, SSH transport, оба Proxy и постоянные туннели.
 
 ## SSH enrollment
 
-madUI и CLI умеют создавать раздельные Ed25519 identities для:
-
-- конечного target node;
-- Proxy A;
-- Proxy B.
-
-CLI:
+Для первого подключения и установки ключей:
 
 ```bash
 sudo madwebmirror enroll
 ```
 
-При первом подключении `ssh-copy-id` может попросить пароль и подтверждение fingerprint. Ввод происходит **не в браузере**, а непосредственно в административном терминале. Пароль не возвращается приложению и не записывается в конфиг.
+Пароль и подтверждение fingerprint вводятся непосредственно в терминале. Runtime-подключения используют ключи и строгую проверку `known_hosts`.
 
-Ключи по умолчанию находятся под:
+По умолчанию ключи находятся в `/var/lib/madwebmirror/ssh/`, а общий trust store — в `/var/lib/madwebmirror/.ssh/known_hosts`.
 
-```text
-/var/lib/madwebmirror/ssh/
-```
-
-Общий проверенный `known_hosts`:
-
-```text
-/var/lib/madwebmirror/.ssh/known_hosts
-```
-
-Один и тот же trust store используется tunnel supervisor, OpenSSH jump transport и libssh/SFTP-клиентом.
-
-Пример transport-конфигурации:
+Пример конфигурации узла за двумя Proxy:
 
 ```ini
 ssh_transport=jump
@@ -112,36 +130,20 @@ ssh_jump_fallback_identity_file=/var/lib/madwebmirror/ssh/proxy-b
 
 ## SSH Tunnel Manager
 
-Tunnel policy хранится в:
-
-```text
-/etc/madwebmirror/tunnels.conf
-```
-
-Формат строки:
+Политика туннелей хранится в `/etc/madwebmirror/tunnels.conf`.
 
 ```text
 tunnel=ID|ROUTE|DIRECTION|BIND_HOST|BIND_PORT|TARGET_HOST|TARGET_PORT|ENABLED
 ```
 
-Например одна логическая LocalForward-группа через оба Proxy:
+Пример failover-группы LocalForward через два Proxy:
 
-```text
+```ini
 tunnel=web-admin|primary|local|127.0.0.1|18080|192.168.1.20|80|true
 tunnel=web-admin|fallback|local|127.0.0.1|18080|192.168.1.20|80|true
 ```
 
-Одинаковый `ID` означает **failover-группу**. Одновременно активен только один SSH-процесс, поэтому два Proxy не дерутся за один local bind. Если активный маршрут завершается, supervisor пробует второй Proxy; если недоступны оба — повторяет попытки.
-
-Поддерживаются:
-
-- `local` (`ssh -L`);
-- `remote` (`ssh -R`);
-- независимые группы туннелей;
-- отдельный identity key для каждого Proxy;
-- strict host-key checking;
-- `ExitOnForwardFailure` и keepalive;
-- автоматический A/B failover.
+Одинаковый `ID` объединяет маршруты в одну failover-группу. Одновременно работает один SSH-процесс. Если активный маршрут завершается, supervisor запускает второй; если недоступны оба, попытки повторяются.
 
 Ручной запуск:
 
@@ -149,106 +151,48 @@ tunnel=web-admin|fallback|local|127.0.0.1|18080|192.168.1.20|80|true
 madwebmirror tunnels
 ```
 
-При обычной установке используется systemd unit:
+При штатной установке supervisor работает через `madwebmirror-tunnels.service` от пользователя `madbackup`.
+
+## Командная строка
 
 ```text
-madwebmirror-tunnels.service
+madwebmirror backup       один backup и deploy
+madwebmirror --daemon     ежедневный backup по расписанию
+madwebmirror monitor      health-check и failover
+madwebmirror ui           административная веб-панель
+madwebmirror enroll       первоначальная установка SSH-ключей
+madwebmirror tunnels      supervisor SSH-туннелей
+madwebmirror install      установка backup-служб и watchdog
+madwebmirror uninstall    удаление установленных служб
 ```
 
-Он работает как `madbackup`, а не root. Tunnel policy остаётся `root:madbackup 0640`: сервис может читать её, но не переписывать.
-
-Из madUI можно сохранить policy, запустить, перезапустить и остановить supervisor. Эти операции проходят через фиксированные verbs `madweb-helper`, а не через произвольный `sudo systemctl ...`.
-
-## Привилегии
-
-Обычные процессы работают без root. Однократный bootstrap устанавливает helper и правило:
-
-```text
-madbackup ALL=(root) NOPASSWD: /usr/local/libexec/madweb-helper *
-```
-
-Это не даёт произвольный root shell: helper содержит закрытый набор проверяемых операций. Среди них подготовка site storage, безопасная генерация nginx/apache route и управление только конкретным tunnel service.
-
-Копии сайтов создаются автоматически:
-
-```text
-/srv/madwebmirror/sites/<site-id>/
-    releases/
-    shared/
-```
-
-Ручная предварительная подготовка web-папок не требуется после bootstrap.
-
-## madUI
-
-Ручной запуск:
+Полная справка:
 
 ```bash
-sudo madwebmirror ui
+madwebmirror --help
 ```
 
-По умолчанию madUI слушает IPv4 `0.0.0.0:8790`. Можно ограничить loopback:
+## Привилегии и безопасность
 
-```bash
-sudo madwebmirror ui --ui-bind=127.0.0.1 --ui-port=8790
-```
+Основные процессы работают от отдельного пользователя `madbackup`. Операции с системными каталогами и конфигурацией веб-сервера выполняет root-owned программа `madweb-helper` с закрытым набором команд и проверкой аргументов.
 
-В текущем madUI есть:
+Helper не предоставляет команд вида `exec`, `shell` или записи произвольного текста в системные конфигурационные файлы. Перед применением конфигурации nginx или Apache выполняется её штатная проверка. Runtime SSH-подключения требуют известный host key.
 
-- terminal trust handshake;
-- карточки Proxy A / Proxy B;
-- `direct / jump / auto` transport;
-- пути identity keys;
-- запуск SSH enrollment;
-- редактор LocalForward/RemoteForward;
-- создание A/B failover-пары одним действием;
-- состояние tunnel systemd-service;
-- `start / restart / stop` tunnel supervisor;
-- параметры сайта, БД, backup schedule и health-check;
-- same-origin POST, SameSite cookie и security headers.
+Старые параметры `remote_pass` и `remote_sudo_pass` пока поддерживаются для совместимости. Новые установки должны использовать SSH-ключи. Окончательное удаление парольного режима остаётся одной из задач перед стабильным выпуском.
 
-madUI разрешает сохранять первый этап конфигурации до заполнения всех site/DB полей. Полная operational validation выполняется перед backup/deploy.
+## Текущее состояние
 
-## CLI
+Ветка `release` содержит текущую публикуемую версию. Разработка продолжается в `develop`. Исходная монолитная реализация сохранена в `legacy`.
 
-```text
-madwebmirror backup
-madwebmirror --daemon
-madwebmirror monitor
-sudo madwebmirror ui
-sudo madwebmirror enroll
-madwebmirror tunnels
-madwebmirror install
-madwebmirror uninstall
-```
-
-`madbackuper` остаётся совместимым alias.
-
-## Сборка вручную
-
-```bash
-sudo apt-get install build-essential libssh-dev openssh-client sudo
-make
-```
-
-Debug:
-
-```bash
-make debug
-```
-
-Включены AddressSanitizer и UndefinedBehaviorSanitizer.
-
-## Безопасность и текущие ограничения
-
-SSH требует заранее подтверждённый host key. Jump-host password authentication не используется в runtime; первый пароль нужен только для enrollment.
-
-Старые поля `remote_pass` и `remote_sudo_pass` пока остаются в `Config` ради совместимости со старой конфигурацией. madUI их не выставляет как постоянные настройки; их удаление/перенос в отдельный bootstrap-secret store остаётся следующим этапом hardening.
-
-Текущий tunnel failover является стабильным: после перехода на Proxy B он не переключается обратно на A, пока B остаётся жив. Это специально избегает лишнего flapping; более умный controlled failback можно добавить позже.
+Проект собирается в GitHub Actions и проходит базовые CLI smoke-тесты. Перед применением на рабочем сервере рекомендуется проверить установку и аварийное переключение на тестовых узлах: автоматические end-to-end тесты реального backup/deploy и nginx/Apache failover пока не реализованы.
 
 ## Ветки
 
-- `snapshot` — зафиксированная старая рабочая версия;
-- `release` — прежняя release-ветка;
-- `develop` — текущая разработка.
+- `release` — текущая публикуемая версия;
+- `develop` — основная ветка разработки;
+- `legacy` — исходная рабочая монолитная версия;
+- `snapshot` — прежний технический снимок, совпадающий с началом `legacy`.
+
+## Лицензия
+
+Проект распространяется на условиях [The Unlicense](LICENSE).

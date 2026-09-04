@@ -83,7 +83,7 @@ The target host may then be a private address such as `192.168.1.20`. The manage
 
 Jump connections use OpenSSH as the forwarding process because Ubuntu 24.04 currently ships libssh 0.10.x, while native libssh ProxyJump support arrived later. The jump command is generated only from validated `[user@]host[:port]` fields, runs in batch mode, requires strict host-key checking and does not support jump-host password authentication. Each jump route may use its own identity key.
 
-The topology model also reserves a list of `SshTunnelSpec` objects on each jump route. This is the place for persistent LocalForward/RemoteForward definitions in madUI. A future tunnel supervisor can materialize those definitions as agent-managed/systemd tunnels without changing the node/ingress schema.
+The topology model contains a list of `SshTunnelSpec` objects for persistent LocalForward and RemoteForward definitions. The tunnel supervisor groups primary and fallback routes by tunnel ID, runs one route at a time and can be managed directly or through systemd and madUI.
 
 Key policy:
 
@@ -123,6 +123,10 @@ route-nginx SITE_ID SERVER_NAME BACKEND_HOST PORT
 route-apache SITE_ID SERVER_NAME BACKEND_HOST PORT
 nginx-reload
 apache-reload
+tunnels-enable
+tunnels-disable
+tunnels-restart
+tunnels-status
 ```
 
 It must never expose a verb such as `exec`, `shell`, `run-command`, arbitrary destination paths, or arbitrary config text.
